@@ -1,0 +1,138 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+ENV/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# 本地运行产物 / 日志
+*.log
+.DS_Store
+Thumbs.db
+
+# 个人 / 敏感信息（绝不提交）
+*.token
+*.key
+secrets.*
+.env
+.env.*
+!.env.example
+!.env.admin.example
+auth/
+management/
+backups/
+deploy/one-click/data/
+wheels/
+*.info
+*.tar.gz
+management-access.txt
+.idea/
+
+# ============================================================
+# AI Agent 工作目录（各 CLI 在本地的会话状态 / 缓存 / 私有配置）
+# ------------------------------------------------------------
+# 这些目录是各个 agent 工具运行时生成的本地工作区，与项目代码无关，
+# 且常包含个人偏好、会话历史与缓存，一律不纳入版本控制。
+# 注意：AGENTS.md / CLAUDE.md 等「指令文件」属于项目约定，仍需提交。
+# ============================================================
+
+# opencode
+.opencode/
+
+# Claude Code
+.claude/
+.claude.json
+.claude.json.backup
+
+# Codex CLI
+.codex/
+
+# Cursor
+.cursor/
+
+# Gemini CLI
+.gemini/
+
+# Aider（仅忽略会话历史与缓存，保留 .aider.conf.yml 等配置文件）
+.aider.chat.history.md
+.aider.input.history
+.aider.tags.cache.v3/
+
+# Windsurf / Codeium
+.windsurf/
+.codeium/
+
+# Continue
+.continue/
+
+# Cline / Roo Code
+.cline/
+.roo/
+
+# Qwen Code
+.qwen/
+
+# Kiro
+.kiro/
+
+# Trae
+.trae/
+
+# Amp
+.amp/
+
+# Crush
+.crush/
+
+# Factory Droid
+.factory/
+
+# Augment
+.augment/
+
+# Zed
+.zed/
+
+# Goose
+.goose/
+
+# OpenHands
+.openhands/
+
+# SpecStory
+.specstory/
+
+# 通用 agent 临时工作目录
+.agent/
+.agents/
+.agent-work/
+
+# ============================================================
+# 本地调试残留（仓库根目录，下划线前缀的临时脚本与抓包产物）
+# ------------------------------------------------------------
+# 这些文件由人工排查问题时临时生成，不属于项目源码。
+# 采用「根目录锚定（前导 /）+ 下划线前缀」双重限定，
+# 确保不会误伤 admin/、core/、tests/ 下的正常模块（如 __init__.py）。
+# ============================================================
+
+# 临时调试脚本 / 抓包与对比产物
+/_*.py
+/_*.sse
+/_*.txt
+/_*.err
+/_*.out
+
+# 人工对比输出
+/*_after.txt
+/sse_out*.txt
+
+# 本地一键启动脚本（内含个人密钥，绝不提交；配置方式见 README）
+/run.ps1
+
