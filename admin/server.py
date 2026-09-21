@@ -17,6 +17,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
 from core import converter
+from core import settings
 from core import site_routing
 from .browser_login import DEFAULT_SITE, SITE_HOSTS, BrowserLogin
 from .pool import AccountPool, PoolMiddleware
@@ -237,8 +238,23 @@ class AdminMiddleware:
         await self.app(scope, replay, secure_send)
 
 
+def resolve_store_paths(root=None, auth_dir=None):
+    """统一优先级：显式参数 > 环境变量 > .env > 默认值（当前运行目录）。
+
+    - 数据目录：root > ADMIN_DIR > MANAGEMENT_DATA_DIR > cwd
+    - 凭据目录：auth_dir > CODEBUDDY_AUTH_DIR > cwd/auth
+    """
+    settings.ensure_loaded()
+    data_dir = root or settings.path("ADMIN_DIR") or settings.path("MANAGEMENT_DATA_DIR") or settings.cwd()
+    auth = auth_dir or settings.path("CODEBUDDY_AUTH_DIR") or settings.cwd() / "auth"
+    return data_dir, auth
+
+
 def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secure_cookie=True):
-    store = Store(root or os.environ.get("MANAGEMENT_DATA_DIR", "/data/management"), auth_dir or os.environ.get("CODEBUDDY_AUTH_DIR", "/data/auth"), initial_key if initial_key is not None else os.environ.get("CODEBUDDY2OPENAI_KEY", ""), admin_key or os.environ.get("ADMIN_KEY", ""))
+    data_dir, auth = resolve_store_paths(root, auth_dir)
+    key = initial_key if initial_key is not None else settings.get("CODEBUDDY2OPENAI_KEY", "")
+    admin = admin_key or settings.get("ADMIN_KEY", "")
+    store = Store(data_dir, auth, key, admin)
     converter._check_auth = store.check_api
     converter.CONFIG.update({"desensitize": True, "no_compact": False, "log_path": None})
     browser_login = BrowserLogin(store.save_browser_account)
@@ -580,4 +596,5 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
 
 
 if __name__ == "__main__":
-    uvicorn.run(create_app(), host="0.0.0.0", port=8787, log_level="warning", proxy_headers=True, forwarded_allow_ips="*")
+    settings.ensure_loaded()
+    uvicorn.run(create_app(), host="0.0.0.0", port=settings.get_int("PORT", 8787), log_level="warning", proxy_headers=True, forwarded_allow_ips="*")

@@ -49,6 +49,7 @@ except ImportError:  # 模块缺失时降级为不脱敏
         return body
 
 
+from . import settings
 from .anthropic_adapter import (
     AnthropicStreamConverter,
     anthropic_request_to_chat,
@@ -117,10 +118,8 @@ def profile_of_headers(headers: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-def auth_dirs() -> list[Path]:
-    env_dir = os.environ.get("CODEBUDDY_AUTH_DIR")
-    if env_dir:
-        return [Path(env_dir)]
+def _desktop_auth_dirs() -> list[Path]:
+    """桌面端（CodeBuddy / WorkBuddy）默认登录态目录，按平台区分。"""
     home = Path.home()
     plat = sys.platform
     if plat == "darwin":
@@ -138,6 +137,19 @@ def auth_dirs() -> list[Path]:
         return [local / "CodeBuddyExtension" / "Data" / "Public" / "auth"]
     xdg = Path(os.environ.get("XDG_DATA_HOME", home / ".local" / "share"))
     return [xdg / "CodeBuddyExtension" / "Data" / "Public" / "auth"]
+
+
+def auth_dirs() -> list[Path]:
+    """登录态目录查找顺序：显式配置 > 当前运行目录/auth > 桌面端目录。
+
+    ``CODEBUDDY_AUTH_DIR``（环境变量或 .env）一旦设置就只认它，与旧行为一致。
+    未设置时以“当前运行目录”为默认值（<cwd>/auth），同时保留桌面端自动发现
+    作为回落 —— 独立转换器仍能直接读取本机已登录的桌面端凭据。
+    """
+    env_dir = settings.get("CODEBUDDY_AUTH_DIR")
+    if env_dir:
+        return [settings.resolve_path(env_dir)]
+    return [settings.cwd() / "auth", *_desktop_auth_dirs()]
 
 
 def find_auth_file() -> Path | None:
@@ -1213,7 +1225,7 @@ async def _post_backend_with_filter_retry(
         and _looks_like_content_filter_text(text)
         and CONFIG.get("desensitize")
         and CONFIG.get("no_compact")
-        and os.environ.get("CODEBUDDY_RESPONSES_DESENSITIZE", "0") == "1"
+        and settings.get("CODEBUDDY_RESPONSES_DESENSITIZE", "0") == "1"
     ):
         retry_body = _chat_body_desensitize(body, force_compact=True)
         _log(
@@ -1275,14 +1287,14 @@ async def create_response(
 
     chat_body = filter_system_identity(chat_body)
     chat_body, projection_stats = project_responses_chat_body(
-        chat_body, preserve=os.environ.get("CODEBUDDY_LOSSY_PROJECTION", "0") != "1"
+        chat_body, preserve=settings.get("CODEBUDDY_LOSSY_PROJECTION", "0") != "1"
     )
     chat_body.setdefault("model", "auto")
     chat_body["stream"] = True
     if "stream_options" not in chat_body:
         chat_body["stream_options"] = {"include_usage": True}
 
-    if os.environ.get("CODEBUDDY_RESPONSES_DESENSITIZE", "0") == "1":
+    if settings.get("CODEBUDDY_RESPONSES_DESENSITIZE", "0") == "1":
         chat_body = _chat_body_desensitize(chat_body)
 
     headers = cred.get_headers()
@@ -1787,14 +1799,15 @@ def preflight() -> bool:
 
 
 def main():
+    settings.ensure_loaded()
     ap = argparse.ArgumentParser(
         description="CodeBuddy -> OpenAI 兼容转换器（直连后端）"
     )
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8787)
+    ap.add_argument("--port", type=int, default=settings.get_int("PORT", 8787))
     ap.add_argument(
         "--api-key",
-        default=os.environ.get("CODEBUDDY2OPENAI_KEY", ""),
+        default=settings.get("CODEBUDDY2OPENAI_KEY", ""),
         help="可选：要求客户端携带的 API key（默认不校验）",
     )
     ap.add_argument(
@@ -1825,7 +1838,7 @@ def main():
     CONFIG["no_compact"] = args.no_compact
     # --log 直接指定文件路径即开启；不传则不记
     CONFIG["log_path"] = (
-        args.log if args.log else os.environ.get("CODEBUDDY2OPENAI_LOG")
+        args.log if args.log else settings.get("CODEBUDDY2OPENAI_LOG")
     )
     af = find_auth_file()
     CONFIG["cred"] = CredentialManager(af) if af else None

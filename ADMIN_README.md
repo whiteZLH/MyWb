@@ -28,14 +28,25 @@
 
 ## 配置与运行
 
-环境变量：
+取值规则（从高到低）：
 
-| 变量 | 用途 |
-|---|---|
-| `ADMIN_KEY` | 独立管理密钥，至少 20 字符，建议随机生成 |
-| `CODEBUDDY2OPENAI_KEY` | 首次迁入的客户端 Key；初始化后从持久化状态读取密钥列表 |
-| `CODEBUDDY_AUTH_DIR` | 登录凭据目录，线上 `/data/auth` |
-| `MANAGEMENT_DATA_DIR` | 账号索引与密钥摘要目录，线上 `/data/management` |
+1. 显式参数（函数 / 命令行传入）
+2. 进程环境变量
+3. `.env` 文件（`python -m admin.server` 会自行加载，不再依赖 `run.ps1`）
+4. 默认值 —— 一律以**当前运行目录**为基准
+
+`.env` 查找顺序：`$MYWB_ENV_FILE` 指定的文件 → `<当前运行目录>/.env`。其中相对路径一律相对当前运行目录解析。设置 `MYWB_SKIP_DOTENV=1` 可关闭自动加载（测试用）。
+
+| 变量 | 用途 | 默认值 |
+|---|---|---|
+| `ADMIN_KEY` | 独立管理密钥，至少 20 字符，建议随机生成 | 无（必填） |
+| `CODEBUDDY2OPENAI_KEY` | 首次迁入的客户端 Key；初始化后从持久化状态读取密钥列表 | 空 |
+| `ADMIN_DIR` | 账号索引与密钥摘要目录（state.json / metrics.json） | 当前运行目录 |
+| `MANAGEMENT_DATA_DIR` | 同 `ADMIN_DIR`，兼容旧部署；两者都设置时 `ADMIN_DIR` 优先 | — |
+| `CODEBUDDY_AUTH_DIR` | 登录凭据目录 | `<当前运行目录>/auth` |
+| `PORT` | 监听端口 | `8787` |
+
+容器部署仍可沿用旧值：`deploy/admin/docker-compose.yml` 显式传入 `CODEBUDDY_AUTH_DIR=/data/auth`、`MANAGEMENT_DATA_DIR=/data/management`，显式环境变量优先级更高，行为不变。
 
 生产使用一个 Uvicorn 进程。会话和账号选择缓存在进程内，不适用于直接增加多 worker。Nginx 终止 HTTPS，后端端口仅绑定服务器回环地址。管理会话重启后需重新登录。
 

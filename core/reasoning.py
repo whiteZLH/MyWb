@@ -14,8 +14,9 @@ reasoning.py — 上游思考内容（reasoning / thinking）字段识别与提�
 
 from __future__ import annotations
 
-import os
 from typing import Any
+
+from . import settings
 
 # 增量字段优先级：越靠前越可信
 _DELTA_REASONING_KEYS = (
@@ -34,7 +35,7 @@ def reasoning_join_enabled() -> bool:
     部分客户端（Codex / 各类 OpenAI 兼容 GUI）会据此把思考渲染成多个独立
     段落/卡片。规整后把空白折叠为单个空格，让思考合并成连续一段。
     """
-    return os.environ.get("CODEBUDDY_REASONING_JOIN", "1") != "0"
+    return settings.get("CODEBUDDY_REASONING_JOIN", "1") != "0"
 
 
 def strip_empty_toolcalls_enabled() -> bool:
@@ -46,7 +47,7 @@ def strip_empty_toolcalls_enabled() -> bool:
     reasoning 块 —— 表现为 opencode 里思考被切成每 token 一个 "Thought" 卡片。
     转发时删除空 tool_calls，仅在真有工具调用时保留。
     """
-    return os.environ.get("CODEBUDDY_STRIP_EMPTY_TOOLCALLS", "1") != "0"
+    return settings.get("CODEBUDDY_STRIP_EMPTY_TOOLCALLS", "1") != "0"
 
 
 class ReasoningJoiner:

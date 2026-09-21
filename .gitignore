@@ -35,6 +35,12 @@ wheels/
 management-access.txt
 .idea/
 
+# 管理后台运行时数据（ADMIN_DIR 指向项目根目录时会生成在这里）
+# state.json 含账号索引与 API Key 摘要，metrics.json 含请求统计，均不得提交。
+state.json
+metrics.json
+state.json.*
+
 # ============================================================
 # AI Agent 工作目录（各 CLI 在本地的会话状态 / 缓存 / 私有配置）
 # ------------------------------------------------------------

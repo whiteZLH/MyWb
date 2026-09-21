@@ -16,6 +16,7 @@ import os
 import time
 from typing import Any
 
+from . import settings
 from .reasoning import (
     extract_reasoning_delta,
     ReasoningJoiner,
@@ -31,7 +32,7 @@ def _rand_id(prefix: str = "") -> str:
 
 
 def _reasoning_enabled() -> bool:
-    return os.environ.get("CODEBUDDY_REASONING", "1") != "0"
+    return settings.get("CODEBUDDY_REASONING", "1") != "0"
 
 
 def _usage_tokens(usage: dict) -> dict:

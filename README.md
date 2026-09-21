@@ -389,12 +389,17 @@ docker run -d --name mywb -p 8787:8787 \
 
 ### 相关环境变量
 
-| 变量 | 说明 |
-|------|------|
-| `CODEBUDDY_AUTH_DIR` | 指定登录态目录 |
-| `CODEBUDDY2OPENAI_KEY` | 本地 API Key |
-| `CODEBUDDY2OPENAI_LOG` | 日志路径 |
-| `CODEBUDDY_REASONING` | 是否向前端透出模型思考过程，默认 `1`（开启）；设 `0` 关闭 |
+取值规则（从高到低）：命令行参数 → 进程环境变量 → `.env` 文件 → 默认值（当前运行目录）。
+
+转换器与后台都会自行加载当前运行目录下的 `.env`（可用 `MYWB_ENV_FILE` 指定其它文件，`MYWB_SKIP_DOTENV=1` 关闭）。因此直接 `python3 -m core.converter` / `python3 -m admin.server` 也能读到 `.env`，不必经过 `run.ps1`。
+
+| 变量 | 说明 | 默认值 |
+|------|------|--------|
+| `CODEBUDDY_AUTH_DIR` | 指定登录态目录（设置后不再回落到桌面端自动发现） | `<当前运行目录>/auth`，未找到时回落桌面端目录 |
+| `CODEBUDDY2OPENAI_KEY` | 本地 API Key | 空 |
+| `CODEBUDDY2OPENAI_LOG` | 日志路径 | 不记日志 |
+| `PORT` | 监听端口 | `8787` |
+| `CODEBUDDY_REASONING` | 是否向前端透出模型思考过程，默认 `1`（开启）；设 `0` 关闭 | `1` |
 
 ---
 
