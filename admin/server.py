@@ -338,9 +338,12 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
 
     @app.get("/admin/assets/{filename}")
     async def asset(filename: str):
-        if filename not in {"app.js", "style.css"}:
+        # Vue 构建产物（app.js / style.css 及可能的附加静态文件）统一落在 ASSETS 根目录。
+        # 用真实路径做父目录校验，避免 ../ 穿越；不存在的文件仍返回 404。
+        path = (ASSETS / filename).resolve()
+        if path.parent != ASSETS.resolve() or not path.is_file():
             raise HTTPException(404)
-        return FileResponse(ASSETS / filename)
+        return FileResponse(path)
 
     @app.post("/admin/api/login")
     async def login(req: Request):
