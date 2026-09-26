@@ -35,8 +35,11 @@ wheels/
 management-access.txt
 .idea/
 
-# 管理后台运行时数据（ADMIN_DIR 指向项目根目录时会生成在这里）
-# state.json 含账号索引与 API Key 摘要，metrics.json 含请求统计，均不得提交。
+# 管理后台运行时数据（ADMIN_DIR 指向项目根目录时会产生在这里）
+# mywb.db 为 SQLite 数据库，保存账号索引、API Key 摘要、会话与请求记录，不得提交。
+# state.json / metrics.json 为旧版 JSON，首次启动迁移后删除，此处保留忽略以免误提交。
+mywb.db
+mywb.db-*
 state.json
 metrics.json
 state.json.*

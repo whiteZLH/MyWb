@@ -16,6 +16,7 @@ ENV_KEYS = (
     "CODEBUDDY_AUTH_DIR",
     "CODEBUDDY2OPENAI_KEY",
     "ADMIN_KEY",
+    "ADMIN_SECURE_COOKIE",
     "PORT",
     "MYWB_ENV_FILE",
     "MYWB_SKIP_DOTENV",
@@ -230,3 +231,21 @@ def test_create_app_autodiscovers_cwd_dotenv(isolated_env, tmp_path, monkeypatch
     assert Path(data_dir) == tmp_path / "auto-data"
     assert Path(auth) == tmp_path / "auto-auth"
     assert settings.source() == tmp_path / ".env"
+
+
+def test_create_app_secure_cookie_follows_env(isolated_env, tmp_path, monkeypatch):
+    """secure_cookie 默认关闭；ADMIN_SECURE_COOKIE=1 时开启。"""
+    import admin.server as admin_server
+
+    monkeypatch.chdir(tmp_path)
+    auth = tmp_path / "auth"
+    auth.mkdir()
+
+    app = admin_server.create_app(tmp_path / "management", auth, "client-key", "admin-key-long-enough")
+    assert app.state.secure_cookie is False
+    app.state.db.close()
+
+    monkeypatch.setenv("ADMIN_SECURE_COOKIE", "1")
+    app = admin_server.create_app(tmp_path / "management", auth, "client-key", "admin-key-long-enough")
+    assert app.state.secure_cookie is True
+    app.state.db.close()

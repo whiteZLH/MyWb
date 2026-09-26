@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from admin.db import Database
 from admin.metrics import MetricsMiddleware, RequestMetrics, normalize_usage, usage_from_event, carries_token, day_key, _new_bucket
 
 
@@ -165,60 +166,127 @@ class StatsAggregateTests(unittest.TestCase):
         self.assertEqual([row['model'] for row in rows],['b','a'])
         self.assertEqual([row['requests'] for row in rows],[2,1])
 
+    def test_accounts_ranked_and_persisted(self):
+        def record(metrics, account, usage=None, ttft=None, duration=1000):
+            metrics.begin()
+            metrics.finish('/v1/chat/completions','api',200,True,duration,'success',usage=usage,ttft_ms=ttft,account=account)
+        with tempfile.TemporaryDirectory() as temp:
+            db = Database(Path(temp) / 'mywb.db')
+            try:
+                metrics=RequestMetrics(db)
+                record(metrics,'账号甲',{'prompt_tokens':100,'completion_tokens':20},ttft=500,duration=1500)
+                record(metrics,'账号甲',{'prompt_tokens':100,'completion_tokens':20},ttft=500,duration=1500)
+                record(metrics,'账号乙',{'prompt_tokens':50,'completion_tokens':10},ttft=200,duration=1200)
+                rows=metrics.stats()['today']['accounts']
+                self.assertEqual([row['model'] for row in rows],['账号甲','账号乙'])
+                self.assertEqual([row['requests'] for row in rows],[2,1])
+                # 甲：40 tokens 解码 2000ms -> 20 tok/s。
+                self.assertEqual(rows[0]['tokens_per_second'],20.0)
+                # 未标注账号的请求不进入账号维度。
+                self.record(metrics,model='m1')
+                self.assertEqual([row['model'] for row in metrics.stats()['today']['accounts']],['账号甲','账号乙'])
+                metrics.save()
+                reloaded=RequestMetrics(db)
+                self.assertEqual([row['model'] for row in reloaded.stats()['all']['accounts']],['账号甲','账号乙'])
+                self.assertEqual(reloaded.stats()['all']['accounts'][0]['requests'],2)
+            finally:
+                db.close()
+
     def test_all_range_sums_days_and_survives_restart(self):
         with tempfile.TemporaryDirectory() as temp:
-            path=Path(temp)/'metrics.json'
-            metrics=RequestMetrics(path)
-            self.record(metrics,{'prompt_tokens':100,'completion_tokens':10,'prompt_cache_hit_tokens':50},ttft=500,duration=1500,model='m1')
-            metrics.days['2026-01-01']={'all':_new_bucket(),'models':{}}
-            metrics.dirty=True
-            metrics.save()
-            self.assertTrue(path.exists())
-            reloaded=RequestMetrics(path)
-            stats=reloaded.stats()
-            self.assertEqual(stats['all']['requests'],1)
-            self.assertEqual(stats['all']['days'],2)
-            self.assertEqual(stats['all']['since'],'2026-01-01')
-            self.assertEqual(stats['today']['requests'],1)
-            self.assertEqual(stats['all']['cache_hit_rate'],50.0)
-            self.assertNotIn('secret',path.read_text(encoding='utf-8'))
+            db = Database(Path(temp) / 'mywb.db')
+            try:
+                metrics=RequestMetrics(db)
+                self.record(metrics,{'prompt_tokens':100,'completion_tokens':10,'prompt_cache_hit_tokens':50},ttft=500,duration=1500,model='m1')
+                metrics.days['2026-01-01']={'all':_new_bucket(),'models':{}}
+                metrics.dirty=True
+                metrics.save()
+                reloaded=RequestMetrics(db)
+                stats=reloaded.stats()
+                self.assertEqual(stats['all']['requests'],1)
+                self.assertEqual(stats['all']['days'],2)
+                self.assertEqual(stats['all']['since'],'2026-01-01')
+                self.assertEqual(stats['today']['requests'],1)
+                self.assertEqual(stats['all']['cache_hit_rate'],50.0)
+                self.assertNotIn('secret', db.path.read_bytes().decode('utf-8', 'ignore'))
+            finally:
+                db.close()
 
     def test_privacy_and_bounded_day_history(self):
         with tempfile.TemporaryDirectory() as temp:
-            path=Path(temp)/'metrics.json'
-            metrics=RequestMetrics(path)
-            self.record(metrics,{'prompt_tokens':1,'completion_tokens':1},model='m1')
-            self.record(metrics)
-            today=day_key()
-            # Day keys are calendar dates, so the oldest buckets prune first.
-            metrics.days.update({f'2020-01-{i%28+1:02d}-{i:03d}':{'all':_new_bucket(),'models':{}} for i in range(120)})
-            metrics.dirty=True
-            metrics.save()
-            raw=json.loads(path.read_text(encoding='utf-8'))
-            self.assertLessEqual(len(raw['days']),90)
-            self.assertIn(today,raw['days'])
-            self.assertEqual(metrics.stats()['all']['requests'],2)
-            # Only counters survive: no usage payload, prompt or completion text.
-            text=path.read_text(encoding='utf-8')
-            self.assertNotIn('prompt_tokens_details',text)
-            self.assertNotIn('secret-answer',text)
-            self.assertNotIn('sk-',text)
+            db = Database(Path(temp) / 'mywb.db')
+            try:
+                metrics=RequestMetrics(db)
+                self.record(metrics,{'prompt_tokens':1,'completion_tokens':1},model='m1')
+                self.record(metrics)
+                today=day_key()
+                # Day keys are calendar dates, so the oldest buckets prune first.
+                metrics.days.update({f'2020-01-{i%28+1:02d}-{i:03d}':{'all':_new_bucket(),'models':{}} for i in range(120)})
+                metrics.dirty=True
+                metrics.save()
+                self.assertLessEqual(len(db.load_metric_days()),90)
+                self.assertIn(today,db.load_metric_days())
+                self.assertEqual(metrics.stats()['all']['requests'],2)
+                # Only counters survive: no usage payload, prompt or completion text.
+                text=db.path.read_bytes().decode('utf-8', 'ignore')
+                self.assertNotIn('prompt_tokens_details',text)
+                self.assertNotIn('secret-answer',text)
+                self.assertNotIn('sk-',text)
+            finally:
+                db.close()
 
     def test_model_names_are_bounded_in_persisted_state(self):
         with tempfile.TemporaryDirectory() as temp:
-            path=Path(temp)/'metrics.json'
-            metrics=RequestMetrics(path)
-            self.record(metrics,model='x'*500)
-            metrics.save()
-            raw=json.loads(path.read_text(encoding='utf-8'))
-            self.assertEqual(len(next(iter(raw['days'].values()))['models']),1)
-            self.assertEqual(len(next(iter(next(iter(raw['days'].values()))['models']))),80)
+            db = Database(Path(temp) / 'mywb.db')
+            try:
+                metrics=RequestMetrics(db)
+                self.record(metrics,model='x'*500)
+                metrics.save()
+                days=db.load_metric_days()
+                self.assertEqual(len(next(iter(days.values()))['models']),1)
+                self.assertEqual(len(next(iter(next(iter(days.values()))['models']))),80)
+            finally:
+                db.close()
 
-    def test_corrupt_state_file_is_ignored(self):
+    def test_corrupt_legacy_file_is_ignored(self):
         with tempfile.TemporaryDirectory() as temp:
-            path=Path(temp)/'metrics.json'
-            path.write_text('{not json',encoding='utf-8')
-            self.assertEqual(RequestMetrics(path).stats()['all']['requests'],0)
+            legacy=Path(temp)/'metrics.json'
+            legacy.write_text('{not json',encoding='utf-8')
+            db = Database(Path(temp) / 'mywb.db')
+            try:
+                self.assertEqual(RequestMetrics(db, legacy_path=legacy).stats()['all']['requests'],0)
+            finally:
+                db.close()
+
+    def test_legacy_json_migrates_then_is_removed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            legacy=Path(temp)/'metrics.json'
+            legacy.write_text(json.dumps({'version':1,'days':{day_key():{'all':{**_new_bucket(),'requests':3},'models':{}}}}),encoding='utf-8')
+            db = Database(Path(temp) / 'mywb.db')
+            try:
+                metrics=RequestMetrics(db, legacy_path=legacy)
+                self.assertEqual(metrics.stats()['all']['requests'],3)
+                self.assertFalse(legacy.exists())
+                # A second start must not resurrect or double-count the import.
+                again=RequestMetrics(db, legacy_path=legacy)
+                self.assertEqual(again.stats()['all']['requests'],3)
+            finally:
+                db.close()
+
+    def test_request_log_persists_and_is_bounded(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db = Database(Path(temp) / 'mywb.db')
+            try:
+                metrics=RequestMetrics(db)
+                for index in range(105):
+                    metrics.begin()
+                    metrics.finish('/v1/chat/completions','api',200,True,10,'success',model='m%d' % index)
+                self.assertEqual(db.count_request_log(),100)
+                reloaded=RequestMetrics(db)
+                self.assertEqual(len(reloaded.snapshot()['recent']),100)
+                self.assertEqual(reloaded.snapshot()['recent'][0]['model'],'m104')
+            finally:
+                db.close()
 
     def test_day_key_uses_beijing_calendar(self):
         # 2026-01-01T00:30+08:00 is still Dec 31 UTC.
@@ -288,6 +356,76 @@ class StreamUsageTests(unittest.IsolatedAsyncioTestCase):
               b'data: [DONE]\n\n')
         stats=await self.collect([body])
         self.assertNotIn('secret-answer',json.dumps(stats))
+
+
+class RecentRecordTests(unittest.IsolatedAsyncioTestCase):
+    async def run_request(self, chunks, stream=True, source="api", key_label=None, path="/v1/chat/completions",
+                          account=None, scope_account=None):
+        metrics = RequestMetrics()
+        async def app(scope, receive, send):
+            await send({'type':'http.response.start','status':200,'headers':[(b'content-type', b'text/event-stream' if stream else b'application/json')]})
+            for chunk in chunks:
+                await send({'type':'http.response.body','body':chunk,'more_body':True})
+            await send({'type':'http.response.body','body':b'','more_body':False})
+        async def receive(): return {'type':'http.request','body':b''}
+        async def send(m): pass
+        headers = [(b'authorization', b'Bearer sk-test')]
+        scope = {'type':'http','method':'POST','path':path,'headers':headers}
+        if scope_account is not None:
+            scope['account_label'] = scope_account
+        await MetricsMiddleware(app, metrics, source, key_label=key_label, account=account)(scope, receive, send)
+        return metrics.snapshot()['recent'][0]
+
+    async def test_recent_carries_streaming_key_and_tokens(self):
+        body=(b'data: {"model":"m1","choices":[{"delta":{"content":"hi"}}]}\n\n'
+              b'data: {"model":"m1","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":10,"prompt_cache_hit_tokens":80,"completion_thinking_tokens":4}}\n\n'
+              b'data: [DONE]\n\n')
+        seen = {}
+        record = await self.run_request([body], key_label=lambda headers: seen.update(headers) or "客户端 A")
+        self.assertTrue(record['streaming'])
+        self.assertEqual(record['key'], '客户端 A')
+        self.assertIsNotNone(record['ttft_ms'])
+        self.assertEqual(record['tokens'], {'prompt':100,'completion':10,'total':110,'cached':80,'reasoning':4})
+        self.assertEqual(seen[b'authorization'], b'Bearer sk-test')
+
+    async def test_nonstream_record_has_no_ttft_and_null_tokens(self):
+        record = await self.run_request([json.dumps({'model':'m2','choices':[{'message':{'content':'hi'}}]}).encode()], stream=False)
+        self.assertFalse(record['streaming'])
+        self.assertIsNone(record['ttft_ms'])
+        self.assertIsNone(record['tokens'])
+        self.assertEqual(record['key'], '')
+
+    async def test_key_label_failure_never_breaks_recording(self):
+        def boom(headers):
+            raise RuntimeError('resolver down')
+        record = await self.run_request([b'data: [DONE]\n\n'], key_label=boom)
+        self.assertEqual(record['key'], '')
+        self.assertEqual(record['status'], 200)
+
+    async def test_recent_never_leaks_secret(self):
+        body=(b'data: {"choices":[{"delta":{"content":"secret-answer"}}]}\n\n'
+              b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":2}}\n\n'
+              b'data: [DONE]\n\n')
+        record = await self.run_request([body], key_label=lambda headers: "客户端 A")
+        text = json.dumps(record)
+        self.assertNotIn('secret-answer', text)
+        self.assertNotIn('sk-test', text)
+
+    async def test_recent_carries_selected_account_from_scope(self):
+        record = await self.run_request([b'data: [DONE]\n\n'], scope_account='账号甲')
+        self.assertEqual(record['account'], '账号甲')
+
+    async def test_default_account_used_without_scope(self):
+        record = await self.run_request([b'data: [DONE]\n\n'], account='手动测试账号')
+        self.assertEqual(record['account'], '手动测试账号')
+
+    async def test_scope_account_overrides_default(self):
+        record = await self.run_request([b'data: [DONE]\n\n'], account='手动测试账号', scope_account='账号池账号')
+        self.assertEqual(record['account'], '账号池账号')
+
+    async def test_account_absent_is_empty_string(self):
+        record = await self.run_request([b'data: [DONE]\n\n'])
+        self.assertEqual(record['account'], '')
 
 
 if __name__=='__main__':unittest.main()

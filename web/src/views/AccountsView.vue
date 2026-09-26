@@ -29,7 +29,7 @@ const filtered = computed(() => {
 
 const counts = computed(() => {
   const count = (status) => accounts.value.filter((a) => a.pool_state === status).length;
-  return `全部 ${accounts.value.length}  ·  可用 ${count("available")}  ·  冷却 ${count("cooling")}  ·  暂停 ${count("paused")}  ·  耗尽 ${count("exhausted")}`;
+  return `全部 ${accounts.value.length}  ·  可用 ${count("available")}  ·  并发已满 ${count("busy")}  ·  冷却 ${count("cooling")}  ·  暂停 ${count("paused")}  ·  耗尽 ${count("exhausted")}`;
 });
 
 const known = computed(() => accounts.value.filter((a) => a.remaining != null));
@@ -132,6 +132,16 @@ function askRename(account) {
   });
 }
 
+function askConcurrency(account) {
+  openConfirm({
+    title: "设置并发上限",
+    desc: `「${account.name}」同时处理的请求数上限；达到上限后新请求会跳过该账号。`,
+    number: account.max_concurrent || 0,
+    numberLabel: "并发上限",
+    submit: (value) => api("accounts/" + account.id, { method: "PATCH", body: { max_concurrent: value } }),
+  });
+}
+
 function askToggle(account) {
   openConfirm({
     title: account.enabled ? "暂停这个账号？" : "恢复这个账号？",
@@ -190,6 +200,7 @@ function askDelete(account) {
       <select v-model="filter" aria-label="筛选账号状态">
         <option value="all">全部状态</option>
         <option value="available">可用</option>
+        <option value="busy">并发已满</option>
         <option value="cooling">冷却中</option>
         <option value="paused">已暂停</option>
         <option value="exhausted">积分耗尽</option>
@@ -204,6 +215,7 @@ function askDelete(account) {
           <tr>
             <th>账号</th>
             <th>状态 / 签到</th>
+            <th>并发</th>
             <th>剩余积分</th>
             <th>凭据有效期</th>
             <th class="align-right">操作</th>
@@ -231,6 +243,12 @@ function askDelete(account) {
               </small>
             </td>
             <td>
+              <strong class="credit-number">
+                {{ a.inflight ?? 0 }}<template v-if="a.max_concurrent"> / {{ a.max_concurrent }}</template>
+              </strong>
+              <small class="cell-note">{{ a.max_concurrent ? "在途 / 上限" : "不限并发" }}</small>
+            </td>
+            <td>
               <strong class="credit-number">{{ creditsOf(a) }}</strong>
               <small class="cell-note">
                 {{ a.credits_updated ? stamp(a.credits_updated * 1000) : "点击查询积分" }}{{ a.credits_stale && a.credits_updated ? " · 待刷新" : "" }}
@@ -250,13 +268,14 @@ function askDelete(account) {
                 </template>
                 <button class="switch" v-if="a.enabled && !a.active" @click="askActivate(a)">设为手动 / 测试</button>
                 <button @click="askRename(a)">备注</button>
+                <button @click="askConcurrency(a)">并发</button>
                 <button @click="askToggle(a)">{{ a.enabled ? "暂停" : "恢复" }}</button>
                 <button class="danger" @click="askDelete(a)">删除</button>
               </div>
             </td>
           </tr>
           <tr v-if="!filtered.length && accounts.length">
-            <td colspan="5" class="muted">没有符合筛选条件的账号。</td>
+            <td colspan="6" class="muted">没有符合筛选条件的账号。</td>
           </tr>
         </tbody>
       </table>

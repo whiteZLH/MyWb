@@ -5,6 +5,7 @@ import { refresh, showToast } from "../store.js";
 
 const dialog = ref(null);
 const renameValue = ref("");
+const numberValue = ref(0);
 const error = ref("");
 const busy = ref(false);
 
@@ -13,6 +14,7 @@ watch(
   (open) => {
     if (open) {
       renameValue.value = ui.confirm.rename ?? "";
+      numberValue.value = ui.confirm.number ?? 0;
       error.value = "";
       dialog.value?.showModal();
     } else {
@@ -27,7 +29,11 @@ async function onSubmit() {
   try {
     const submit = ui.confirm.submit;
     const rename = ui.confirm.rename;
-    await submit(rename !== null ? renameValue.value : undefined);
+    const number = ui.confirm.number;
+    let value;
+    if (rename !== null) value = renameValue.value;
+    else if (number !== null) value = Number(numberValue.value);
+    await submit(value);
     closeConfirm();
     await refresh();
     showToast("操作已保存");
@@ -47,6 +53,11 @@ async function onSubmit() {
       <template v-if="ui.confirm.rename !== null">
         <label for="rename-value">账号备注</label>
         <input id="rename-value" v-model="renameValue" maxlength="60" />
+      </template>
+      <template v-else-if="ui.confirm.number !== null">
+        <label for="number-value">{{ ui.confirm.numberLabel || "数值" }}</label>
+        <input id="number-value" v-model="numberValue" type="number" min="0" max="1000" step="1" />
+        <p class="muted">0 表示不限制并发。</p>
       </template>
       <p class="field-error" role="alert">{{ error }}</p>
       <div class="dialog-actions">

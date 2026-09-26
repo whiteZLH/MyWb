@@ -102,23 +102,28 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-> 注意：无论是启动服务，还是执行 `python3 -m core.converter --help`，都必须先装依赖。
+> 注意：启动服务前必须先装依赖。
 
 ### 3. 启动
 
-最常用的启动方式：
+项目只有一个运行入口：管理后台 `admin.server`（协议转换核心作为 ASGI 应用被它挂载，不再单独运行）。
+
+先准备一个 `.env`（可直接复制示例），至少填一个随机管理密钥：
 
 ```bash
-uv run python -m core.converter --desensitize --log converter.log
+cp .env.example .env
+# 编辑 .env，填写 ADMIN_KEY（至少 20 字符）与可选的客户端 Key
 ```
 
-或：
+然后启动：
 
 ```bash
-python3 -m core.converter --desensitize --log converter.log
+python3 -m admin.server
 ```
 
-看到监听 `http://127.0.0.1:8787` 就说明已经起来了。
+看到监听 `http://127.0.0.1:8787` 就说明已经起来了。管理界面在 `http://127.0.0.1:8787/admin/`。
+
+> 脱敏默认开启。
 
 ### 4. 快速自检
 
@@ -137,11 +142,7 @@ curl http://127.0.0.1:8787/v1/models
 
 这是当前最推荐的接法。Codex CLI 走的是 `/v1/responses`，而不是 `/v1/chat/completions`。
 
-推荐启动命令：
-
-```bash
-uv run python -m core.converter --desensitize --log converter.log
-```
+确保服务已启动（`python3 -m admin.server`）。
 
 把下面配置合并到 `~/.codex/config.toml`：
 
@@ -171,20 +172,15 @@ codex --profile workbuddy "你的任务描述"
 
 补充说明：
 
-- 推荐保留 `--desensitize`
+- 脱敏默认已开启（管理后台启动时固定启用 `desensitize`）
 - 当前 `/v1/responses` 默认已经会做投影压缩
-- 如果你想尽量保留原始 system prompt，可试 `--desensitize --no-compact`
-- `--desensitize --no-compact` 下若仍命中审核，当前实现会自动退回紧凑模式重试一次
+- 请求日志与统计在管理后台「请求记录 / 运行统计」页查看，不再有 `--log` 参数
 
 ### Claude Code / CC Switch
 
 Claude Code 不走 OpenAI 协议，而是走 Anthropic Messages。
 
-推荐启动命令：
-
-```bash
-uv run python -m core.converter --desensitize --log converter.log
-```
+确保服务已启动（`python3 -m admin.server`）。
 
 在 CC Switch 里配置：
 
@@ -202,7 +198,7 @@ uv run python -m core.converter --desensitize --log converter.log
 
 - 模型名必须填写腾讯后端支持的真实模型名
 - 不做 Anthropic 模型名到腾讯模型名的自动映射
-- Claude Code 场景强烈建议开启 `--desensitize`
+- Claude Code 场景依赖默认开启的脱敏
 
 ### 其他 OpenAI 兼容客户端
 
@@ -218,7 +214,7 @@ uv run python -m core.converter --desensitize --log converter.log
 配置方式：
 
 - Base URL: `http://127.0.0.1:8787/v1`
-- API Key: 留空，或填你启动时设置的 `--api-key`
+- API Key: 在管理后台「客户端密钥」中创建的 Key
 - 模型名: `glm-5.2` / `deepseek-v4-pro` / `kimi-k2.7` / `auto` 等
 
 ---
@@ -228,24 +224,10 @@ uv run python -m core.converter --desensitize --log converter.log
 ### 基本启动
 
 ```bash
-python3 -m core.converter
-python3 -m core.converter --desensitize
-python3 -m core.converter --desensitize --log converter.log
-python3 -m core.converter --api-key mysecret
-python3 -m core.converter --port 9000
+python3 -m admin.server
 ```
 
-### 命令行参数
-
-| 参数 | 默认值 | 说明 |
-|------|------|------|
-| `--host` | `127.0.0.1` | 监听地址 |
-| `--port` | `8787` | 监听端口 |
-| `--api-key` | 无 | 给本地客户端加一层鉴权 |
-| `--log` | 无 | 记录请求与响应日志 |
-| `--desensitize` | 关 | 压缩运行时提示、去掉 tool description、零宽脱敏高风险关键词 |
-| `--no-compact` | 关 | 配合 `--desensitize` 使用，保留更完整的原始 system prompt |
-| `--skip-check` | 否 | 跳过启动预检 |
+监听地址与端口、脱敏、日志等由 `.env` 配置（见下文「相关环境变量」），不再有命令行参数。
 
 ### curl 示例
 
@@ -265,43 +247,31 @@ curl -N http://127.0.0.1:8787/v1/chat/completions \
 
 ## 日志与排障
 
-### 推荐启动方式
+### 查看请求记录
 
-```bash
-uv run python -m core.converter --desensitize --log converter.log
-```
+服务启动后，请求与统计都在管理后台里看：
+
+- 「请求记录」页：逐条查看时间、处理账号、来源、模型、接口、流式与否、首字延迟、总耗时、生成速度与 Token 消耗
+- 「运行统计」页：按模型与按账号汇总请求量、成功率与生成速度
+
+> 管理后台入口固定将文件日志关闭（`log_path=None`），排障以页面上的请求记录为准。
 
 ### 日志里能看到什么
 
-每次请求都会带一个唯一 ID，常见日志包括：
-
-- `REQUEST BODY`
-- `RESPONSES → CHAT BODY`
-- `RESPONSES PROJECTION`
-- `RESPONSE BODY`
-- `RESPONSE RAW SSE`
-- `⚠️内容审核拦截`
-
-其中 `RESPONSES PROJECTION` 会告诉你：
-
-- 投影前后消息数
-- 投影前后字符数
-- tool schema 压缩量
-- 是否丢掉了 harness 消息
-- 是否保留了 anchor user
+每条请求在后台记录里都能看到来源、状态与耗时。若需要更详细的请求体/响应体日志，可自行在部署环境中开启对应调试能力。
 
 ### 最常见问题
 
 #### 找不到登录文件
 
-说明桌面端没登录，或者登录目录不在默认路径。先确认桌面端已经真正完成登录。
+说明桌面端没登录，或者登录目录不在默认路径。先确认桌面端已经真正完成登录；也可以在管理后台用浏览器授权直接添加账号。
 
 #### 401
 
 分两种：
 
-- 本地 401：你启用了 `--api-key`，但客户端没带同一个 key
-- 后端 401：腾讯 token 失效，尝试重新打开桌面端登录
+- 本地 401：客户端没带管理后台创建的 API Key（在「客户端密钥」页创建）
+- 后端 401：腾讯 token 失效，尝试重新打开桌面端登录，或在后台刷新凭据
 
 #### 响应慢
 
@@ -319,19 +289,13 @@ uv run python -m core.converter --desensitize --log converter.log
 - 竞争品牌词
 - tool description 中的安全术语
 
-建议排查顺序：
-
-1. 开 `--log`
-2. 看同一请求 ID 下的 `REQUEST BODY` 或 `RESPONSES → CHAT BODY`
-3. 如果是 Codex CLI，再看 `RESPONSES PROJECTION`
-4. 开 `--desensitize`
-5. 如果还不稳，再尝试 `--desensitize --no-compact`
+管理后台默认已开启脱敏，可缓解此类拦截；若仍命中，可在请求记录里定位是哪个模型/接口触发的。
 
 ---
 
-## 管理后台（可选）
+## 管理后台
 
-除原转换器外，项目附带一个中文 Web 管理后台（`admin/`），适合服务器长期运行：
+项目附带一个中文 Web 管理后台（`admin/`），它也是服务的运行入口，适合服务器长期运行：
 
 - 浏览器授权添加国内 / 国际 CodeBuddy / WorkBuddy 账号，无需桌面端；多账号自动轮转、冷却与积分耗尽避让
 - 凭据刷新、积分余额查询、每日自动签到（默认北京时间 09:00，可配置）
@@ -348,7 +312,7 @@ python3 -m admin.server
 
 然后访问 `http://127.0.0.1:8787/admin/`。一键 Docker 部署见下文；详细说明见 [ADMIN_README.md](ADMIN_README.md)。
 
-> 管理后台为单进程设计，正式对外部署必须放在 HTTPS 反向代理之后（示例：`deploy/admin/nginx.conf.example`）。直接运行 `python3 -m core.converter` 的原有用法不受影响。
+> 管理后台为单进程设计，正式对外部署必须放在 HTTPS 反向代理之后（示例：`deploy/admin/nginx.conf.example`）。
 
 ---
 
@@ -358,7 +322,7 @@ python3 -m admin.server
 
 前提是把宿主机登录态目录挂进去，因为容器里拿不到桌面端 auth 文件。
 
-### 一键部署（推荐，含管理后台）
+### 一键部署（推荐）
 
 一条命令完成密钥生成、镜像构建与启动：
 
@@ -368,30 +332,20 @@ bash deploy/one-click/deploy.sh
 
 脚本会自动生成 `ADMIN_KEY` 与客户端 Key（保存在 `deploy/one-click/.env`，仅首次显示），随后访问 `http://127.0.0.1:8787/admin/`。改端口：编辑 `deploy/one-click/.env` 里的 `PORT` 后重跑脚本。
 
-### docker compose（独立转换器）
+### docker compose（手动）
 
-先改 `deploy/standalone/docker-compose.yml` 里的 auth 挂载路径，再执行：
-
-```bash
-docker compose -f deploy/standalone/docker-compose.yml up -d --build
-```
-
-### docker run（独立转换器）
+先改 `deploy/admin/docker-compose.yml` 里的 auth 挂载路径，再执行：
 
 ```bash
-docker build -t mywb -f deploy/standalone/Dockerfile .
-
-docker run -d --name mywb -p 8787:8787 \
-  -v ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth:/data/auth:ro \
-  -e CODEBUDDY_AUTH_DIR=/data/auth \
-  mywb
+cp deploy/admin/env.example .env   # 填写 ADMIN_KEY 与 CODEBUDDY2OPENAI_KEY
+docker compose -f deploy/admin/docker-compose.yml up -d --build
 ```
 
 ### 相关环境变量
 
 取值规则（从高到低）：命令行参数 → 进程环境变量 → `.env` 文件 → 默认值（当前运行目录）。
 
-转换器与后台都会自行加载当前运行目录下的 `.env`（可用 `MYWB_ENV_FILE` 指定其它文件，`MYWB_SKIP_DOTENV=1` 关闭）。因此直接 `python3 -m core.converter` / `python3 -m admin.server` 也能读到 `.env`，不必经过 `run.ps1`。
+服务会自行加载当前运行目录下的 `.env`（可用 `MYWB_ENV_FILE` 指定其它文件，`MYWB_SKIP_DOTENV=1` 关闭），不必经过 `run.ps1`。
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
@@ -439,20 +393,19 @@ docker run -d --name mywb -p 8787:8787 \
 ```text
 MyWb/
 ├── core/                      # 协议转换核心
-│   ├── converter.py           # 主入口，FastAPI 服务（python3 -m core.converter）
+│   ├── converter.py           # ASGI 应用（由 admin.server 挂载）
 │   ├── responses_adapter.py   # OpenAI Responses ↔ Chat 适配
 │   ├── responses_projection.py# Codex / agent 请求投影压缩
 │   ├── anthropic_adapter.py   # Anthropic Messages ↔ Chat 适配
 │   ├── site_routing.py        # 站点路由：国内/国际 × CodeBuddy/WorkBuddy
 │   └── desensitize.py         # 运行时文本压缩与零宽脱敏
-├── admin/                     # 中文管理后台（可选，python3 -m admin.server）
+├── admin/                     # 中文管理后台（运行入口，python3 -m admin.server）
 │   ├── server.py              # 管理 API、会话与静态页面
 │   ├── pool.py                # 账号池轮转、冷却、积分与签到
 │   ├── browser_login.py       # 浏览器授权登录
 │   ├── metrics.py             # 请求统计
 │   └── static/                # 前端资源
 ├── deploy/                    # 部署
-│   ├── standalone/            # 独立转换器（Dockerfile + compose）
 │   ├── admin/                 # 管理后台（Dockerfile + compose + nginx 示例）
 │   └── one-click/             # 一键式部署（deploy.sh 自动生成密钥并启动）
 ├── tests/                     # 单元测试（pytest）
@@ -514,7 +467,9 @@ cd MyWb
 
 uv venv
 uv pip install -r requirements.txt
-uv run python -m core.converter --desensitize --log converter.log
+
+cp .env.example .env   # 填写 ADMIN_KEY（至少 20 字符）
+uv run python -m admin.server
 ```
 
 Then verify:
@@ -526,7 +481,7 @@ curl http://127.0.0.1:8787/v1/models
 
 ### Codex CLI
 
-Use `/v1/responses` and keep `--desensitize` enabled.
+Use `/v1/responses` (desensitization is on by default).
 
 ```toml
 [model_providers.workbuddy]
@@ -563,17 +518,9 @@ Use `/v1/messages`:
 
 ### Notes
 
-- `--desensitize` is recommended for both Codex CLI and Claude Code
+- desensitization is enabled by default in the admin console
 - `/v1/responses` already applies backend-facing projection by default
-- `--desensitize --no-compact` preserves more of the original system prompt
-- if that still gets review-blocked, `/v1/responses` will retry once in compact mode
-- an optional Chinese web admin console (`python3 -m admin.server`, see [ADMIN_README.md](ADMIN_README.md)) adds browser-based account authorization, multi-account rotation, client API keys, daily check-in and request metrics; one-command Docker setup: `bash deploy/one-click/deploy.sh`
-
-### CLI Options
-
-```bash
-python3 -m core.converter [--host HOST] [--port PORT] [--api-key KEY] [--log PATH] [--desensitize] [--skip-check]
-```
+- the Chinese web admin console (`python3 -m admin.server`, see [ADMIN_README.md](ADMIN_README.md)) is the single entry point and adds browser-based account authorization, multi-account rotation, client API keys, daily check-in and request metrics; one-command Docker setup: `bash deploy/one-click/deploy.sh`
 
 ### Disclaimer
 

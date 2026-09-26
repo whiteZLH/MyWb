@@ -13,15 +13,12 @@ MyWb — 把 CodeBuddy / WorkBuddy 的订阅暴露成标准 OpenAI 兼容 API。
 跨平台：自动定位 auth 目录（macOS / Windows / Linux）。
 依赖：fastapi + uvicorn + httpx（pip install fastapi "uvicorn[standard]" httpx）。
 
-用法：
-  python3 converter.py                       # 默认 127.0.0.1:8787
-  python3 converter.py --port 9000
-  python3 converter.py --api-key mysecret    # 启用客户端鉴权
+本模块只导出 ASGI 应用 ``app``，由管理后台（``python3 -m admin.server``）挂载；
+不再提供独立运行的命令行入口。
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import sys
@@ -30,7 +27,6 @@ import time
 from pathlib import Path
 
 import httpx
-import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -1754,124 +1750,3 @@ async def count_tokens(
                 "error": {"message": str(e)[:500], "type": "api_error", "code": 502}
             },
         ) from None
-
-
-# ---------------------------------------------------------------------------
-# 启动
-# ---------------------------------------------------------------------------
-
-
-def preflight() -> bool:
-    af = find_auth_file()
-    sys.stderr.write("==== 预检 ====\n")
-    sys.stderr.write(f"平台      : {sys.platform}\n")
-    sys.stderr.write(f"Python    : {sys.version.split()[0]}\n")
-    sys.stderr.write(f"登录文件  : {af or '(未找到)'}\n")
-    if auth_dirs():
-        sys.stderr.write(f"已查目录  : {', '.join(str(d) for d in auth_dirs())}\n")
-    ok = True
-    if af is None:
-        sys.stderr.write(
-            "\n[警告] 未找到登录文件。请在桌面端完成登录（CodeBuddy/WorkBuddy）。\n"
-        )
-        ok = False
-    else:
-        try:
-            cm = CredentialManager(af)
-            info = cm.summary()
-            sys.stderr.write(
-                f"账号      : {info.get('nickname')} / {info.get('enterpriseName')}\n"
-            )
-            sys.stderr.write(
-                f"站点      : {info.get('profile')} ({info.get('domain')})\n"
-            )
-            sys.stderr.write(
-                f"后端      : {cm.chat_url()} (直连，原生 function calling)\n"
-            )
-            sys.stderr.write(
-                f"token过期 : {'是(将自动刷新)' if info['token_expired'] else '否'}\n"
-            )
-        except Exception as e:
-            sys.stderr.write(f"[警告] 读取凭据失败：{e}\n")
-            ok = False
-    sys.stderr.write("================\n")
-    return ok
-
-
-def main():
-    settings.ensure_loaded()
-    ap = argparse.ArgumentParser(
-        description="CodeBuddy -> OpenAI 兼容转换器（直连后端）"
-    )
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=settings.get_int("PORT", 8787))
-    ap.add_argument(
-        "--api-key",
-        default=settings.get("CODEBUDDY2OPENAI_KEY", ""),
-        help="可选：要求客户端携带的 API key（默认不校验）",
-    )
-    ap.add_argument(
-        "--log",
-        default=None,
-        metavar="PATH",
-        help="开启日志并写到该文件（如 --log converter.log 或 --log /tmp/cb.log）。"
-        "不传则不记日志。",
-    )
-    ap.add_argument(
-        "--desensitize",
-        action="store_true",
-        help="启用脱敏：对 system 消息里的合规模板敏感词（DoS/exploit/credential 等）"
-        "插入零宽空格，缓解被后端内容审核误拦。默认关闭。",
-    )
-    ap.add_argument(
-        "--no-compact",
-        action="store_true",
-        help="配合 --desensitize 使用：跳过 system/harness 压缩，仅做零宽脱敏。"
-        "保留原始 system prompt 完整内容（如 Claude Code 的行为指令），"
-        "但审核误拦风险略高于默认压缩模式。",
-    )
-    ap.add_argument("--skip-check", action="store_true", help="跳过启动预检")
-    args = ap.parse_args()
-
-    CONFIG["api_key"] = args.api_key
-    CONFIG["desensitize"] = args.desensitize
-    CONFIG["no_compact"] = args.no_compact
-    # --log 直接指定文件路径即开启；不传则不记
-    CONFIG["log_path"] = (
-        args.log if args.log else settings.get("CODEBUDDY2OPENAI_LOG")
-    )
-    af = find_auth_file()
-    CONFIG["cred"] = CredentialManager(af) if af else None
-
-    if not args.skip_check:
-        preflight()
-
-    sys.stderr.write(
-        f"\n✅ 监听 http://{args.host}:{args.port}（直连后端，原生 function calling）\n"
-    )
-    sys.stderr.write("   GET  /v1/models\n")
-    sys.stderr.write(
-        "   POST /v1/chat/completions   (原生 tools/tool_calls，支持流式)\n"
-    )
-    sys.stderr.write("   POST /v1/responses          (Responses API，Codex CLI 兼容)\n")
-    sys.stderr.write(
-        "   POST /v1/messages           (Anthropic API，Claude Code / CC Switch 兼容)\n"
-    )
-    sys.stderr.write("   GET  /health\n")
-    if args.api_key:
-        sys.stderr.write("   鉴权已启用（API key 已设置）\n")
-    if CONFIG["log_path"]:
-        sys.stderr.write(f"   日志      : {CONFIG['log_path']}\n")
-    if args.desensitize:
-        mode = "零宽脱敏 + 保留全文" if args.no_compact else "零宽脱敏 + 压缩摘要"
-        sys.stderr.write(f"   脱敏      : 已启用（{mode}）\n")
-    sys.stderr.write("按 Ctrl+C 退出。\n\n")
-
-    # 启动时写一条标记
-    _log("==== converter 启动 ====")
-
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
-
-
-if __name__ == "__main__":
-    main()

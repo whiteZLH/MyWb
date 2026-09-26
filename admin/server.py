@@ -20,6 +20,7 @@ from core import converter
 from core import settings
 from core import site_routing
 from .browser_login import DEFAULT_SITE, SITE_HOSTS, BrowserLogin
+from .db import Database
 from .pool import AccountPool, PoolMiddleware
 from .metrics import RequestMetrics, MetricsMiddleware
 
@@ -51,7 +52,7 @@ def clean_name(value, fallback):
 
 
 class Store:
-    def __init__(self, root, auth_dir, initial_key, admin_key):
+    def __init__(self, root, auth_dir, initial_key, admin_key, db=None):
         if len(admin_key) < 20:
             raise RuntimeError("ADMIN_KEY must contain at least 20 characters")
         self.root, self.auth_dir = Path(root), Path(auth_dir)
@@ -59,32 +60,72 @@ class Store:
         self.auth_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.lock = threading.RLock()
         self.admin_digest = digest(admin_key)
-        self.sessions, self.attempts = {}, {}
+        self.attempts = {}
         self.test_lock = asyncio.Lock()
         self.test_keys = set()
         self.managers = {}
         self.started = time.time()
         self.events = deque(maxlen=40)
-        self.path = self.root / "state.json"
-        if self.path.exists():
-            self.data = json.loads(self.path.read_text(encoding="utf-8"))
-        else:
-            self.data = {"accounts": {}, "active": None, "keys": {}}
-            for p in sorted(self.auth_dir.glob("*.info")):
-                try:
-                    doc = json.loads(p.read_text(encoding="utf-8"))
-                    self.validate_credential(doc)
-                except (ValueError, OSError, HTTPException):
-                    continue
-                aid = secrets.token_hex(8)
-                name = str(doc.get("account", {}).get("nickname") or "已迁移账号")[:60]
-                self.data["accounts"][aid] = {"name": name, "file": p.name, "enabled": not bool(doc.get("disabled")), "created": int(time.time())}
-                if self.data["active"] is None and not doc.get("disabled"):
-                    self.data["active"] = aid
-            if initial_key:
-                self.add_key("原有 API Key", initial_key)
-            self.save()
+        # 数据库是唯一数据源；`self.data` 保留为内存快照，兼容既有调用点与测试。
+        self.db = db if db is not None else Database(self.root / "mywb.db")
+        self.path = self.db.path
+        self._migrate_legacy_json()
+        if self.db.get_meta("initialized") != "1":
+            self._bootstrap(initial_key)
+        self.data = self.db.load_state()
+        self.sessions = self.db.sessions()
         self.sync_active()
+
+    def _bootstrap(self, initial_key):
+        """首次运行：从 auth/*.info 建立账号索引，并导入初始 API Key。"""
+        data = {"accounts": {}, "active": None, "keys": {}}
+        for p in sorted(self.auth_dir.glob("*.info")):
+            try:
+                doc = json.loads(p.read_text(encoding="utf-8"))
+                self.validate_credential(doc)
+            except (ValueError, OSError, HTTPException):
+                continue
+            aid = secrets.token_hex(8)
+            name = str(doc.get("account", {}).get("nickname") or "已迁移账号")[:60]
+            data["accounts"][aid] = {"name": name, "file": p.name, "enabled": not bool(doc.get("disabled")), "created": int(time.time())}
+            if data["active"] is None and not doc.get("disabled"):
+                data["active"] = aid
+        if initial_key:
+            value = initial_key
+            data["keys"][secrets.token_hex(8)] = {"name": "原有 API Key", "hash": digest(value), "hint": value[:5] + "…" + value[-4:], "created": int(time.time())}
+        self.db.save_state(data)
+        self.db.set_meta("initialized", 1)
+
+    def _migrate_legacy_json(self):
+        """把旧 state.json 导入数据库，成功后删除原文件。
+
+        metrics.json 的迁移由 ``RequestMetrics`` 负责（它掌握桶结构）。
+        """
+        state_path = self.root / "state.json"
+        if not state_path.exists():
+            return
+        if self.db.get_meta("initialized") == "1":
+            # 数据库已在用，遗留 JSON 视为陈旧备份，直接清理。
+            self._discard_legacy(state_path)
+            return
+        try:
+            data = json.loads(state_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                data.setdefault("accounts", {})
+                data.setdefault("keys", {})
+                self.db.save_state(data)
+                self.db.set_meta("initialized", 1)
+        except (ValueError, OSError):
+            return
+        self._discard_legacy(state_path)
+
+    @staticmethod
+    def _discard_legacy(*paths):
+        for path in paths:
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
     @staticmethod
     def validate_credential(doc):
@@ -109,7 +150,10 @@ class Store:
                 raise HTTPException(400, "账号字段格式不正确")
 
     def save(self):
-        write_json(self.path, self.data)
+        self.db.save_state(self.data)
+
+    def save_sessions(self):
+        self.db.replace_sessions(self.sessions)
 
     def save_browser_account(self, doc, name):
         self.validate_credential(doc)
@@ -165,7 +209,7 @@ class Store:
     def account_rows(self):
         result = []
         for aid, item in self.data["accounts"].items():
-            row = {"id": aid, "name": item["name"], "enabled": item["enabled"], "active": aid == self.data["active"], "created": item["created"]}
+            row = {"id": aid, "name": item["name"], "enabled": item["enabled"], "active": aid == self.data["active"], "created": item["created"], "max_concurrent": int(item.get("max_concurrent") or 0)}
             try:
                 doc = json.loads(self.file_for(item).read_text(encoding="utf-8"))
                 expiry = doc["auth"].get("expiresAt", 0)
@@ -193,6 +237,24 @@ class Store:
             allowed = hashed in self.test_keys or any(hmac.compare_digest(hashed, item["hash"]) for item in self.data["keys"].values())
         if not allowed:
             raise HTTPException(401, "invalid api key")
+
+    def key_label(self, authorization, x_api_key):
+        """把请求携带的密钥映射为展示名（不保留密钥本身）。
+
+        命中测试密钥返回「连接测试」，命中客户端密钥返回其名称，
+        其它情况返回空串。仅用于请求记录，不参与鉴权。
+        """
+        token = authorization[7:].strip() if authorization and authorization.startswith("Bearer ") else x_api_key or ""
+        if not token:
+            return ""
+        hashed = digest(token)
+        with self.lock:
+            if hashed in self.test_keys:
+                return "连接测试"
+            for item in self.data["keys"].values():
+                if hmac.compare_digest(hashed, item["hash"]):
+                    return item.get("name") or "未命名密钥"
+        return ""
 
     def require_admin(self, req):
         sid = req.cookies.get(COOKIE, "")
@@ -250,16 +312,19 @@ def resolve_store_paths(root=None, auth_dir=None):
     return data_dir, auth
 
 
-def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secure_cookie=True):
+def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secure_cookie=None, db=None):
     data_dir, auth = resolve_store_paths(root, auth_dir)
+    if secure_cookie is None:
+        secure_cookie = settings.get_bool("ADMIN_SECURE_COOKIE", False)
     key = initial_key if initial_key is not None else settings.get("CODEBUDDY2OPENAI_KEY", "")
     admin = admin_key or settings.get("ADMIN_KEY", "")
-    store = Store(data_dir, auth, key, admin)
+    database = db if db is not None else Database(Path(data_dir) / "mywb.db")
+    store = Store(data_dir, auth, key, admin, db=database)
     converter._check_auth = store.check_api
     converter.CONFIG.update({"desensitize": True, "no_compact": False, "log_path": None})
     browser_login = BrowserLogin(store.save_browser_account)
     pool = AccountPool(store)
-    metrics = RequestMetrics(store.root / "metrics.json")
+    metrics = RequestMetrics(database, legacy_path=store.root / "metrics.json")
     @asynccontextmanager
     async def lifespan(app):
         async def reap():
@@ -302,14 +367,24 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             except asyncio.CancelledError:
                 pass
             await asyncio.to_thread(metrics.save)
+            if db is None:
+                database.close()
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.store = store
+    app.state.db = database
+    app.state.secure_cookie = secure_cookie
     app.state.browser_login = browser_login
     app.state.pool = pool
     app.state.metrics = metrics
     app.add_middleware(AdminMiddleware)
     app.add_middleware(PoolMiddleware, pool=pool)
-    app.add_middleware(MetricsMiddleware, metrics=metrics)
+    app.add_middleware(
+        MetricsMiddleware, metrics=metrics,
+        key_label=lambda headers: store.key_label(
+            headers.get(b"authorization", b"").decode("latin-1"),
+            headers.get(b"x-api-key", b"").decode("latin-1"),
+        ),
+    )
 
     async def payload(req):
         try:
@@ -366,6 +441,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             if len(store.sessions) >= 100:
                 store.sessions.pop(next(iter(store.sessions)))
             store.sessions[digest(sid)] = {"csrf": csrf, "expires": now + 12 * 3600}
+            store.save_sessions()
         response = JSONResponse({"csrf": csrf})
         response.set_cookie(COOKIE, sid, secure=secure_cookie, httponly=True, samesite="strict", path="/admin", max_age=12 * 3600)
         return response
@@ -380,6 +456,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         await browser_login.cancel_owner(digest(req.cookies.get(COOKIE, "")))
         with store.lock:
             store.sessions.pop(digest(req.cookies.get(COOKIE, "")), None)
+            store.save_sessions()
         response = JSONResponse({"ok": True})
         response.delete_cookie(COOKIE, path="/admin", secure=secure_cookie, httponly=True, samesite="strict")
         return response
@@ -422,6 +499,11 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         store.require_admin(req)
         with store.lock:
             return metrics.stats()
+
+    @app.get("/admin/api/requests")
+    async def requests(req: Request):
+        store.require_admin(req)
+        return {"requests": metrics.snapshot()["recent"]}
 
     @app.post("/admin/api/accounts/{aid}/actions/{action}")
     async def account_action(aid: str, action: str, req: Request):
@@ -473,7 +555,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             aid = secrets.token_hex(8)
             filename = aid + ".info"
             write_json(store.auth_dir / filename, doc)
-            store.data["accounts"][aid] = {"file": filename, "name": name, "created": int(time.time()), "enabled": True}
+            store.data["accounts"][aid] = {"file": filename, "name": name, "created": int(time.time()), "enabled": True, "max_concurrent": 0}
             if store.data["active"] is None:
                 store.data["active"] = aid
             store.save()
@@ -495,6 +577,11 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 if type(body["enabled"]) is not bool:
                     raise HTTPException(400, "启用状态不正确")
                 new["enabled"] = body["enabled"]
+            if "max_concurrent" in body:
+                value = body["max_concurrent"]
+                if type(value) is not int or isinstance(value, bool) or not 0 <= value <= 1000:
+                    raise HTTPException(400, "并发上限需为 0–1000 的整数（0 表示不限）")
+                new["max_concurrent"] = value
             if body.get("active") is True:
                 if not new["enabled"]:
                     raise HTTPException(400, "请先启用账号")
@@ -577,7 +664,8 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 temp_key = secrets.token_urlsafe(48)
                 store.test_keys.add(digest(temp_key))
             try:
-                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=MetricsMiddleware(converter.app, metrics, source="test")), base_url="http://internal") as client:
+                test_account = pool.account_label(store.data.get("active")) if store.data.get("active") else ""
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=MetricsMiddleware(converter.app, metrics, source="test", account=test_account)), base_url="http://internal") as client:
                     result = await asyncio.wait_for(client.post("/v1/chat/completions", headers={"Authorization": "Bearer " + temp_key}, json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1024, "stream": False}), timeout=90)
                 data = result.json()
                 answer = data.get("choices", [{}])[0].get("message", {}).get("content", "") if result.status_code == 200 else ""

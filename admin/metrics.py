@@ -1,4 +1,4 @@
-"""Bounded process-lifetime counters; never store prompts, responses or keys.
+"""Bounded request counters and the request log; never store prompts, responses or keys.
 
 Beyond the request/success/duration counters the overview page already shows,
 this module folds the usage records the upstream reports (prompt-prefix cache
@@ -6,9 +6,12 @@ hits, reasoning tokens, decode throughput) into per-day, per-model aggregates
 that back the console's runtime-stats page. Only numbers are retained: prompts,
 completions and API keys never reach the aggregation, and nothing here is ever
 written back into a response.
+
+Aggregates and the most recent 100 request records are persisted through
+``admin.db.Database`` (SQLite); older installs are migrated from
+``metrics.json`` on first start and the legacy file is then removed.
 """
 import json
-import os
 import threading
 import time
 from collections import deque
@@ -16,6 +19,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 PATHS = {"/v1/chat/completions", "/v1/responses", "/v1/messages"}
+
+# 账号展示名通过 ASGI scope 在中间件间传递：PoolMiddleware（内层）在选定账号后
+# 写入 scope["account_label"]，MetricsMiddleware（外层）在记录时读取。scope 是每个
+# 请求独享的可变字典，无需担心并发串扰或上下文重置时序。
 
 # Day buckets follow the same Beijing calendar the account pool uses for
 # check-ins, so "today" means the same thing everywhere in the console.
@@ -26,7 +33,7 @@ CN = timezone(timedelta(hours=8))
 # request volume.
 TTFT_BUCKETS_MS = (100, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000, 7500, 10000, 15000, 20000, 30000, 60000, 120000)
 
-# History is bounded so a long-lived process cannot grow state.json without limit.
+# History is bounded so a long-lived process cannot grow the database without limit.
 MAX_DAYS = 90
 
 _BUCKET_KEYS = (
@@ -284,51 +291,68 @@ def _view(bucket):
     }
 
 
-def _write_json(path, value):
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as out:
-        json.dump(value, out, ensure_ascii=False, separators=(",", ":"))
-        out.flush()
-        os.fsync(out.fileno())
-    os.replace(tmp, path)
-
-
 class RequestMetrics:
-    def __init__(self, path=None):
+    def __init__(self, db=None, legacy_path=None):
         self.lock = threading.Lock()
         self.started_at = int(time.time())
         self.in_flight = self.total = self.success = self.http_success = 0
         self.duration_sum = 0
         self.api_count = self.test_count = 0
+        self.db = db
         self.recent = deque(maxlen=100)
-        self.path = Path(path) if path else None
         self.days = {}
         self.dirty = False
+        if db is not None and legacy_path is not None:
+            self._migrate_legacy(Path(legacy_path))
         self._load()
+
+    def _migrate_legacy(self, path):
+        """把旧 metrics.json 的按天聚合导入数据库，成功后删除原文件。"""
+        if not path.exists():
+            return
+        if self.db.load_metric_days():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            days = data.get("days") if isinstance(data, dict) else None
+            if isinstance(days, dict):
+                self.db.replace_metric_days(days)
+        except (ValueError, OSError):
+            return
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
     # ---- persistence ----
 
     def _load(self):
-        if self.path is None or not self.path.exists():
+        if self.db is None:
             return
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (ValueError, OSError):
-            return
-        days = data.get("days") if isinstance(data, dict) else None
-        if not isinstance(days, dict):
+            days = self.db.load_metric_days()
+        except Exception:
             return
         for key, value in days.items():
             if not isinstance(key, str) or not isinstance(value, dict):
                 continue
             models = {}
-            raw_models = value.get("models")
-            if isinstance(raw_models, dict):
-                for name, bucket in raw_models.items():
-                    if isinstance(name, str) and name:
-                        models[name[:80]] = _adopt(bucket)
-            self.days[key] = {"all": _adopt(value.get("all")), "models": models}
+            for name, bucket in (value.get("models") or {}).items():
+                if isinstance(name, str) and name:
+                    models[name[:80]] = _adopt(bucket)
+            accounts = {}
+            for name, bucket in (value.get("accounts") or {}).items():
+                if isinstance(name, str) and name:
+                    accounts[name[:80]] = _adopt(bucket)
+            self.days[key] = {"all": _adopt(value.get("all")), "models": models, "accounts": accounts}
+        try:
+            self.recent = deque(self.db.request_log(100), maxlen=100)
+        except Exception:
+            pass
 
     def _prune(self):
         for key in sorted(self.days)[:-MAX_DAYS]:
@@ -336,18 +360,18 @@ class RequestMetrics:
 
     def save(self):
         """Flush pending counters; a no-op when nothing changed since the last call."""
-        if self.path is None:
+        if self.db is None:
             return
         with self.lock:
             if not self.dirty:
                 return
             self._prune()
-            payload = {"version": 1, "days": self.days}
+            days = self.days
             self.dirty = False
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            _write_json(self.path, payload)
-        except OSError:
+            self.db.upsert_metric_days(days)
+            self.db.prune_metric_days(MAX_DAYS)
+        except Exception:
             with self.lock:
                 self.dirty = True
 
@@ -357,10 +381,29 @@ class RequestMetrics:
         with self.lock:
             self.in_flight += 1
 
-    def finish(self, path, source, status, ok, duration, outcome, usage=None, ttft_ms=None, model=None):
+    def finish(self, path, source, status, ok, duration, outcome, usage=None, ttft_ms=None, model=None,
+               streaming=False, key_label="", account=""):
         duration_ms = float(duration)
         normalized = normalize_usage(usage)
         http_ok = status is not None and 200 <= status < 300
+        record = {
+            "time": int(time.time()), "path": path, "source": source,
+            "status": status, "ok": ok, "duration_ms": round(duration_ms),
+            "outcome": outcome, "model": model or "",
+            "ttft_ms": round(ttft_ms) if ttft_ms is not None else None,
+            "streaming": bool(streaming), "key": key_label or "",
+            # 账号展示名（非凭据），用于按账号维度汇总；未识别时为空串。
+            "account": account or "",
+            # Only numbers survive: the token tally mirrors the aggregates and
+            # never carries prompt or completion text.
+            "tokens": None if normalized is None else {
+                "prompt": normalized["prompt_tokens"],
+                "completion": normalized["completion_tokens"],
+                "total": normalized["total_tokens"],
+                "cached": normalized["cache_hit_tokens"],
+                "reasoning": normalized["reasoning_tokens"],
+            },
+        }
         with self.lock:
             self.in_flight -= 1
             self.total += 1
@@ -369,16 +412,22 @@ class RequestMetrics:
             self.duration_sum += duration_ms
             self.api_count += int(source == "api")
             self.test_count += int(source == "test")
-            self.recent.appendleft({"time": int(time.time()), "path": path, "source": source,
-                                    "status": status, "ok": ok, "duration_ms": round(duration_ms),
-                                    "outcome": outcome, "model": model or "",
-                                    "ttft_ms": round(ttft_ms) if ttft_ms is not None else None})
-            day = self.days.setdefault(day_key(), {"all": _new_bucket(), "models": {}})
+            self.recent.appendleft(record)
+            day = self.days.setdefault(day_key(), {"all": _new_bucket(), "models": {}, "accounts": {}})
             _record(day["all"], normalized, ttft_ms, duration_ms, ok, http_ok, source)
             if model:
                 bucket = day["models"].setdefault(model[:80], _new_bucket())
                 _record(bucket, normalized, ttft_ms, duration_ms, ok, http_ok, source)
+            if account:
+                bucket = day["accounts"].setdefault(account[:80], _new_bucket())
+                _record(bucket, normalized, ttft_ms, duration_ms, ok, http_ok, source)
             self.dirty = True
+        if self.db is not None:
+            try:
+                self.db.add_request_log(record)
+                self.db.prune_request_log(100)
+            except Exception:
+                pass
 
     # ---- views ----
 
@@ -392,22 +441,26 @@ class RequestMetrics:
                     "api_count": self.api_count, "test_count": self.test_count, "recent": list(self.recent)}
 
     def stats(self):
-        """Today's and whole-history aggregates, each split by model."""
+        """Today's and whole-history aggregates, each split by model and by account."""
         with self.lock:
             today = day_key()
             today_day = self.days.get(today)
-            overall, models = _new_bucket(), {}
+            overall, models, accounts = _new_bucket(), {}, {}
             for day in self.days.values():
                 _accumulate(overall, day["all"])
                 for name, bucket in day["models"].items():
                     _accumulate(models.setdefault(name, _new_bucket()), bucket)
+                for name, bucket in day.get("accounts", {}).items():
+                    _accumulate(accounts.setdefault(name, _new_bucket()), bucket)
             first_day = min(self.days) if self.days else None
+        today_day = today_day or {}
         return {
             "today": {"date": today, "days": 1, "since": today,
-                      **_view(today_day["all"] if today_day else _new_bucket()),
-                      "models": _rank(today_day["models"] if today_day else {})},
+                      **_view(today_day.get("all") or _new_bucket()),
+                      "models": _rank(today_day.get("models") or {}),
+                      "accounts": _rank(today_day.get("accounts") or {})},
             "all": {"date": today, "days": len(self.days), "since": first_day,
-                    **_view(overall), "models": _rank(models)},
+                    **_view(overall), "models": _rank(models), "accounts": _rank(accounts)},
         }
 
 
@@ -418,8 +471,12 @@ def _rank(models):
 
 
 class MetricsMiddleware:
-    def __init__(self, app, metrics, source="api"):
+    def __init__(self, app, metrics, source="api", key_label=None, account=""):
         self.app, self.metrics, self.source = app, metrics, source
+        # 可选的请求密钥标签解析器：headers -> 展示名。默认不记录任何密钥信息。
+        self.key_label = key_label
+        # 缺省账号展示名：用于不经过 PoolMiddleware 的调用（如后台连接测试）。
+        self.account = account
 
     async def __call__(self, scope, receive, send):
         path = scope.get("path")
@@ -435,6 +492,10 @@ class MetricsMiddleware:
         usage = {}
         model = None
         first_token = None
+        try:
+            key_label = self.key_label(dict(scope.get("headers", []))) if self.key_label else ""
+        except Exception:
+            key_label = ""
 
         def absorb(value):
             nonlocal model, first_token
@@ -534,5 +595,9 @@ class MetricsMiddleware:
             # A non-streaming body only lands once, so its arrival cannot be told
             # apart from the response's end: TTFT is a streaming-only reading.
             ttft = (first_token - start) * 1000 if streaming and first_token is not None else None
+            # PoolMiddleware（内层）在选定账号后写入 scope；未走账号池时回退到
+            # 中间件自身的缺省账号（如后台连接测试的手动账号）。
+            account = scope.get("account_label") or self.account or ""
             self.metrics.finish(path, self.source, status, ok, (time.monotonic()-start)*1000, outcome,
-                                usage=usage or None, model=model, ttft_ms=ttft)
+                                usage=usage or None, model=model, ttft_ms=ttft,
+                                streaming=streaming, key_label=key_label, account=account)

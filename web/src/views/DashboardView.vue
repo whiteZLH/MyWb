@@ -155,7 +155,7 @@ async function copyBase() {
           <button @click="goPage('test')">② 测试模型响应 ↗</button>
           <button @click="goPage('keys')">③ 管理客户端密钥 ↗</button>
           <p class="muted">统计开始于 {{ stamp((metrics.started_at || 0) * 1000) }}</p>
-          <p class="muted">统计随服务重启清零，不追溯升级前的历史请求。</p>
+          <p class="muted">统计自本次进程启动起累计，重启后清零；历史按天聚合在运行统计页查看。</p>
         </article>
       </aside>
     </div>

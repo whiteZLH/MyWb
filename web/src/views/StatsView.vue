@@ -5,6 +5,7 @@ import { number, rate, seconds } from "../format.js";
 
 const data = computed(() => state.stats?.[state.statsRange] ?? {});
 const rows = computed(() => data.value.models ?? []);
+const accountRows = computed(() => data.value.accounts ?? []);
 
 function setRange(range) {
   state.statsRange = range;
@@ -121,9 +122,69 @@ onBeforeUnmount(() => clearInterval(timer));
       </div>
     </div>
 
+    <div class="section-toolbar">
+      <div>
+        <h2>按账号统计</h2>
+        <p>账号池中各账号处理的请求量、Token 用量与生成速度。</p>
+      </div>
+    </div>
+
+    <div class="table-wrap">
+      <table class="stats-table">
+        <thead>
+          <tr>
+            <th>账号</th>
+            <th>输出（思考）</th>
+            <th>首字延迟 (TTFT)</th>
+            <th>生成速度</th>
+            <th>端到端耗时</th>
+            <th>缓存命中</th>
+            <th class="align-right">请求</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="row in accountRows" :key="row.model">
+            <td>
+              <strong>{{ row.model }}</strong>
+              <small class="cell-note">成功率 {{ rate(row.success_rate) }}</small>
+            </td>
+            <td class="mono">
+              {{ number(row.completion_tokens) }}
+              <small v-if="row.reasoning_tokens" class="cell-note">思考 {{ number(row.reasoning_tokens) }}</small>
+            </td>
+            <td class="mono">
+              <template v-if="row.ttft_p50_ms == null">—</template>
+              <template v-else>
+                {{ seconds(row.ttft_p50_ms) }}
+                <small class="cell-note">P50 {{ seconds(row.ttft_avg_ms) }}</small>
+              </template>
+            </td>
+            <td class="mono speed">
+              <template v-if="row.tokens_per_second == null">—</template>
+              <template v-else>
+                {{ row.tokens_per_second.toFixed(1) }}
+                <small class="cell-note">tok/s</small>
+              </template>
+            </td>
+            <td class="mono">{{ seconds(row.avg_duration_ms) }}</td>
+            <td class="mono">
+              {{ rate(row.cache_hit_rate) }}
+              <small class="cell-note">{{ number(row.cache_hit_tokens) }} tokens</small>
+            </td>
+            <td class="align-right mono">{{ number(row.requests) }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <div v-if="!accountRows.length" class="empty">
+        <span class="empty-icon">◷</span>
+        <h3>还没有账号维度的统计</h3>
+        <p>账号池处理请求后，这里会按账号汇总用量与生成速度。</p>
+      </div>
+    </div>
+
     <div class="note-row">
       <span>ⓘ</span>
-      <p>仅汇总请求数量、耗时与上游返回的 Token 计数；不记录提示词、回复内容或密钥。今日数据按北京时间划分，统计按日保留最近 90 天。</p>
+      <p>仅汇总请求数量、耗时与上游返回的 Token 计数；不记录提示词、回复内容或密钥。账号维度按处理请求的账号展示名汇总。今日数据按北京时间划分，统计按日保留最近 90 天。</p>
     </div>
   </section>
 </template>

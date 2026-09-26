@@ -11,6 +11,7 @@ export const state = reactive({
   booting: true,
   overview: null,
   stats: null,
+  requests: null,
   statsRange: "today",
   loading: false,
   loadError: "",
@@ -42,6 +43,7 @@ export function showToast(message) {
 export const PAGES = {
   dashboard: ["让每个账号，各尽其用", "MYWB WORKSPACE", "在这里查看服务运行、账号积分和请求表现。"],
   stats: ["运行统计", "RUNTIME STATS", "查看首字延迟、生成速度、缓存命中与 Token 用量。"],
+  requests: ["请求记录", "REQUEST LOG", "逐条查看最近的调用：来源、首字延迟、耗时与 Token 消耗。"],
   accounts: ["账号池", "ACCOUNT POOL", "集中管理登录凭据、积分与可用状态，让请求自动分配到可用账号。"],
   keys: ["API 密钥", "CLIENT ACCESS", "为每个客户端分配独立密钥，让连接清晰可控。"],
   test: ["连接测试", "CONNECTION LAB", "从当前账号发起请求，确认模型能否正常响应。"],
@@ -65,6 +67,10 @@ export async function loadStats() {
   state.stats = await api("stats");
 }
 
+export async function loadRequests() {
+  state.requests = (await api("requests")).requests ?? [];
+}
+
 /** 登录成功后写入会话并拉取首屏数据。 */
 export async function enter(token) {
   setCsrf(token);
@@ -79,6 +85,7 @@ export function leave() {
   state.authed = false;
   state.overview = null;
   state.stats = null;
+  state.requests = null;
   state.booting = false;
   state.toast = "";
 }
@@ -88,4 +95,5 @@ export function goPage(next) {
   state.page = next;
   history.replaceState(null, "", "#" + next);
   if (next === "stats") loadStats().catch((e) => showToast(e.message));
+  if (next === "requests") loadRequests().catch((e) => showToast(e.message));
 }

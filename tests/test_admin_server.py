@@ -26,18 +26,22 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         self.make_app()
 
     def make_app(self):
+        previous = getattr(self, "app", None)
+        if previous is not None:
+            previous.state.db.close()
         self.app = admin_server.create_app(self.root / "management", self.auth, API, ADMIN)
         self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="https://console.test")
 
     async def asyncTearDown(self):
         await self.client.aclose()
+        self.app.state.db.close()
         self.temp.cleanup()
 
     async def login(self):
         result = await self.client.post("/admin/api/login", json={"key": ADMIN})
         self.assertEqual(result.status_code, 200)
         cookie = result.headers["set-cookie"].lower()
-        for flag in ["secure", "httponly", "samesite=strict", "path=/admin"]:
+        for flag in ["httponly", "samesite=strict", "path=/admin"]:
             self.assertIn(flag, cookie)
         self.client.headers["X-CSRF-Token"] = result.json()["csrf"]
 
@@ -87,7 +91,10 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         await self.client.delete("/admin/api/keys/" + old)
         self.assertEqual((await self.client.get("/v1/models", headers={"Authorization":"Bearer " + API})).status_code, 401)
         self.assertEqual((await self.client.get("/v1/models", headers={"Authorization":"Bearer " + newkey})).status_code, 200)
-        self.assertNotIn(newkey, self.app.state.store.path.read_text(encoding="utf-8"))
+        # 明文密钥绝不落库：库里只有摘要。
+        stored = json.dumps(self.app.state.store.db.load_state())
+        self.assertNotIn(newkey, stored)
+        self.assertNotIn("private-access-token", stored)
         await self.client.aclose()
         self.make_app()
         self.assertEqual((await self.client.get("/v1/models", headers={"Authorization":"Bearer " + API})).status_code, 401)
@@ -102,6 +109,22 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.status_code, 413)
         r = await self.client.get("/admin/assets/unknown.js")
         self.assertEqual(r.status_code, 404)
+
+    async def test_max_concurrent_validation_and_persistence(self):
+        await self.login()
+        aid = (await self.client.get("/admin/api/overview")).json()["accounts"][0]["id"]
+        for bad in ["2", -1, 1001, True, 1.5]:
+            r = await self.client.patch("/admin/api/accounts/" + aid, json={"max_concurrent": bad})
+            self.assertEqual(r.status_code, 400, r.text)
+        r = await self.client.patch("/admin/api/accounts/" + aid, json={"max_concurrent": 3})
+        self.assertEqual(r.status_code, 200)
+        account = (await self.client.get("/admin/api/overview")).json()["accounts"][0]
+        self.assertEqual(account["max_concurrent"], 3)
+        await self.client.aclose()
+        self.make_app()
+        await self.login()
+        account = (await self.client.get("/admin/api/overview")).json()["accounts"][0]
+        self.assertEqual(account["max_concurrent"], 3)
 
     async def test_stats_endpoint_requires_admin(self):
         self.assertEqual((await self.client.get("/admin/api/stats")).status_code, 401)
@@ -128,7 +151,8 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
             self.app.state.metrics.finish("/v1/messages", "api", 200, True, 3000, "success",
                                           usage={"input_tokens": 200, "output_tokens": 40, "cache_read_input_tokens": 150},
                                           ttft_ms=1200, model="deepseek-v4-flash")
-        self.assertTrue((self.root / "management/metrics.json").exists())
+        self.assertTrue((self.root / "management/mywb.db").exists())
+        self.assertFalse((self.root / "management/metrics.json").exists())
         self.make_app()
         await self.login()
         stats = (await self.client.get("/admin/api/stats")).json()
@@ -137,6 +161,18 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats["all"]["cache_hit_rate"], 75.0)
         self.assertEqual(stats["all"]["days"], 1)
 
+    async def test_cookie_secure_flag_follows_config(self):
+        # 默认关闭 Secure，便于纯 HTTP / 局域网访问。
+        result = await self.client.post("/admin/api/login", json={"key": ADMIN})
+        self.assertNotIn("secure", result.headers["set-cookie"].lower())
+
+        await self.client.aclose()
+        self.app.state.db.close()
+        self.app = admin_server.create_app(self.root / "management", self.auth, API, ADMIN, secure_cookie=True)
+        self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="https://console.test")
+        result = await self.client.post("/admin/api/login", json={"key": ADMIN})
+        self.assertIn("secure", result.headers["set-cookie"].lower())
+
     async def test_logout_and_rate_limit(self):
         await self.login()
         self.assertEqual((await self.client.post("/admin/api/logout")).status_code, 200)
@@ -144,6 +180,23 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         for _ in range(8):
             self.assertEqual((await self.client.post("/admin/api/login", json={"key":"wrong"})).status_code, 401)
         self.assertEqual((await self.client.post("/admin/api/login", json={"key":ADMIN})).status_code, 429)
+
+    async def test_session_survives_restart(self):
+        await self.login()
+        csrf = self.client.headers.get("X-CSRF-Token")
+        cookie = self.client.cookies.get("workbuddy_admin")
+        # 重启（重建 app 与 client）后，同一 cookie 仍然有效，无需重新登录。
+        await self.client.aclose()
+        self.make_app()
+        self.client.cookies.set("workbuddy_admin", cookie, domain="console.test")
+        self.client.headers["X-CSRF-Token"] = csrf
+        self.assertEqual((await self.client.get("/admin/api/overview")).status_code, 200)
+        # 登出会删除库内会话，重启后同样失效。
+        await self.client.post("/admin/api/logout")
+        await self.client.aclose()
+        self.make_app()
+        self.client.cookies.set("workbuddy_admin", cookie, domain="console.test")
+        self.assertEqual((await self.client.get("/admin/api/overview")).status_code, 401)
 
 
 if __name__ == "__main__":

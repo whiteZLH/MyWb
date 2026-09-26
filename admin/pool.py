@@ -58,6 +58,7 @@ class AccountPool:
         self.client_factory = client_factory or (lambda: httpx.Client(timeout=20, follow_redirects=False))
         self.locks = {}
         self.cursor = 0
+        self.inflight = {}
         self.jobs = asyncio.Lock()
         self.last_sync = 0
         with store.lock:
@@ -83,6 +84,33 @@ class AccountPool:
                 self.store.data["account_status"].setdefault(aid, {}).update(values)
                 self.store.save()
 
+    def account_label(self, aid):
+        """账号展示名（非凭据），用于请求记录与按账号汇总。"""
+        item = self.store.data["accounts"].get(aid) or {}
+        name = str(item.get("name") or "").strip()
+        return name or aid
+
+    def limit_for(self, aid):
+        """单账号并发上限；0 表示不限制。"""
+        item = self.store.data["accounts"].get(aid) or {}
+        try:
+            return max(0, int(item.get("max_concurrent") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def has_capacity(self, aid):
+        limit = self.limit_for(aid)
+        return limit == 0 or self.inflight.get(aid, 0) < limit
+
+    def release(self, aid):
+        """归还一个在途名额（请求结束或重选账号时调用）。"""
+        with self.store.lock:
+            count = self.inflight.get(aid, 0)
+            if count <= 1:
+                self.inflight.pop(aid, None)
+            else:
+                self.inflight[aid] = count - 1
+
     def state(self, row):
         status = self.store.data["account_status"].get(row["id"], {})
         if not row["enabled"]:
@@ -93,6 +121,8 @@ class AccountPool:
             return "cooling"
         if status.get("credits_updated", 0) > self.clock() - 600 and status.get("remaining") == 0 and status.get("packages", 0) > 0:
             return "exhausted"
+        if not self.has_capacity(row["id"]):
+            return "busy"
         return "available"
 
     def rows(self, rows):
@@ -103,16 +133,18 @@ class AccountPool:
                         "credits_stale": status.get("credits_updated", 0) < self.clock() - 600,
                         "today_checked_in": status.get("checkin_date") == today, "cooldown_until": status.get("cooldown_until", 0),
                         "last_error": status.get("last_error"), "token_refreshed": status.get("token_refreshed"),
-                        "request_count": status.get("request_count", 0)})
+                        "request_count": status.get("request_count", 0),
+                        "inflight": self.inflight.get(row["id"], 0), "max_concurrent": self.limit_for(row["id"])})
         return rows
 
     def select(self, affinity_key=None):
         with self.store.lock:
-            candidates = [row for row in self.store.account_rows() if self.state(row) == "available"]
+            candidates = [row for row in self.store.account_rows()
+                          if self.state(row) == "available"]
             if self.store.data["pool"]["routing"] == "manual":
                 candidates = [row for row in candidates if row["id"] == self.store.data["active"]]
             if not candidates:
-                raise HTTPException(503, "暂无可用账号：请检查暂停、积分、冷却或登录状态")
+                raise HTTPException(503, "暂无可用账号：请检查暂停、积分、冷却、登录状态或并发上限")
             now = self.clock()
             bindings = self.store.data["session_bindings"]
             for key in list(bindings):
@@ -124,10 +156,13 @@ class AccountPool:
             else:
                 aid = candidates[self.cursor % len(candidates)]["id"]
                 self.cursor += 1
+            # 绑定始终跟随本次实际分配的账号：原账号冷却或暂满落到其它账号时，
+            # 会话即改绑到新账号，名额释放后不再回到原账号。
             if affinity_key:
                 if affinity_key not in bindings and len(bindings) >= 4096:
                     del bindings[min(bindings, key=lambda key: bindings[key]["expires"])]
                 bindings[affinity_key] = {"account_id": aid, "expires": now + 86400}
+            self.inflight[aid] = self.inflight.get(aid, 0) + 1
             item = self.store.data["accounts"][aid]
             return aid, self.store.manager_for(aid, item)
 
@@ -317,6 +352,7 @@ class PoolMiddleware:
         if scope["type"] != "http" or scope["method"] != "POST" or scope["path"] not in {"/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/messages/count_tokens"}:
             return await self.app(scope, receive, send)
         headers = dict(scope.get("headers", []))
+        aid = None
         try:
             self.pool.store.check_api(headers.get(b"authorization", b"").decode(), headers.get(b"x-api-key", b"").decode())
             raw = bytearray()
@@ -351,13 +387,21 @@ class PoolMiddleware:
                 await asyncio.to_thread(manager.get_headers)
             except Exception:
                 self.pool.update(aid, cooldown_until=self.pool.clock()+300, last_error="凭据暂不可用，已冷却 5 分钟")
+                self.pool.release(aid)
+                aid = None
                 aid, manager = self.pool.select(affinity_key)
                 await asyncio.to_thread(manager.get_headers)
         except HTTPException as e:
+            if aid is not None:
+                self.pool.release(aid)
             return await JSONResponse({"detail": e.detail}, e.status_code)(scope, receive, send)
         except Exception:
+            if aid is not None:
+                self.pool.release(aid)
             return await JSONResponse({"detail": "账号凭据暂不可用，请刷新凭据或重新授权"}, 503)(scope, receive, send)
         token = REQUEST_CREDENTIAL.set(manager)
+        # 记录本次实际选中的账号展示名，供外层 MetricsMiddleware 按账号汇总。
+        scope["account_label"] = self.pool.account_label(aid)
         status = 200
         buffer = b""
         async def observe(message):
@@ -386,4 +430,5 @@ class PoolMiddleware:
             await self.app(scope, receive, observe)
         finally:
             REQUEST_CREDENTIAL.reset(token)
+            self.pool.release(aid)
             self.pool.record(aid, status)

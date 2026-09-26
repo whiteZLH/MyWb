@@ -16,9 +16,22 @@ export function seconds(ms) {
   return ms === null || ms === undefined ? "—" : (ms / 1000).toFixed(2) + " s";
 }
 
+/**
+ * 单次请求的生成速度（tok/s）：输出 tokens ÷ 解码时长。
+ * 与统计页口径一致，仅在已记录首字延迟（流式）且解码时长为正时可计算。
+ */
+export function tokensPerSecond(record) {
+  const completion = record?.tokens?.completion;
+  const ttft = record?.ttft_ms;
+  const duration = record?.duration_ms;
+  if (!completion || ttft == null || duration == null || duration <= ttft) return null;
+  return completion / ((duration - ttft) / 1000);
+}
+
 /** 账号池状态 → 展示文案与颜色。 */
 export const POOL_STATES = {
   available: ["可用", "green"],
+  busy: ["并发已满", "amber"],
   cooling: ["冷却中", "amber"],
   paused: ["已暂停", ""],
   exhausted: ["积分耗尽", "amber"],
