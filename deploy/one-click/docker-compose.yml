@@ -8,8 +8,8 @@ services:
     container_name: mywb-oneclick
     restart: unless-stopped
     ports:
-      # 仅监听本机回环；对外提供时请在前面加 HTTPS 反向代理
-      - "127.0.0.1:${PORT:-8787}:8787"
+      # 监听所有网卡，允许局域网直连；若只想本机访问，改回 "127.0.0.1:${PORT:-8787}:8787"
+      - "${PORT:-8787}:8787"
     environment:
       ADMIN_KEY: ${ADMIN_KEY:?请先运行 deploy.sh 自动生成，或参考 env.example 手动创建 .env}
       CODEBUDDY2OPENAI_KEY: ${CODEBUDDY2OPENAI_KEY:?请先运行 deploy.sh 自动生成，或参考 env.example 手动创建 .env}
