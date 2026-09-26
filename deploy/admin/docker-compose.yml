@@ -15,6 +15,8 @@ services:
       CODEBUDDY_AUTH_DIR: /data/auth
       MANAGEMENT_DATA_DIR: /data/management
       TZ: Asia/Shanghai
+      # 会话 Cookie 的 Secure 标志；HTTPS 反代对外时在 .env 设为 1
+      ADMIN_SECURE_COOKIE: ${ADMIN_SECURE_COOKIE:-0}
     volumes:
       - ./auth:/data/auth
       - ./management:/data/management

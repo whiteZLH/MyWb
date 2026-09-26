@@ -12,7 +12,7 @@
 - 查看访问令牌到期时间。到期状态来自本地凭据，是否能刷新及调用成功以真实模型测试为准。
 - 新建和撤销客户端 API Key。新密钥只显示一次，服务端仅持久化 SHA-256 摘要。
 - 中文接入指南和真实模型调用测试；测试最多等待 90 秒，生成预算上限 1024 tokens，以便推理模型完成思考并输出正文。
-- 独立管理密钥；12 小时 HttpOnly / Secure / SameSite=Strict 会话 cookie，CSRF 校验，登录失败限流，上传请求最大 1 MB。
+- 独立管理密钥；12 小时 HttpOnly / SameSite=Strict 会话 cookie（`ADMIN_SECURE_COOKIE=1` 时附加 `Secure`），CSRF 校验，登录失败限流，上传请求最大 1 MB。
 - 请求记录页逐条展示调用时间、处理账号、来源、密钥展示名、模型与接口、流式 / 非流式、首字延迟、总耗时、生成速度（tok/s）与 Token 消耗；运行统计页另按账号汇总请求量与生成速度。管理会话与统计数据一并落库，重启不丢。
 
 添加账号默认使用浏览器授权，也可切换到文件导入。授权链接有效期 5 分钟，完成后无需粘贴回调；新账号不会替换已选择的当前账号。授权前需在“登录站点”里选择与账号订阅一致的站点（国内 / 国际 × CodeBuddy / WorkBuddy），服务端会校验上游返回的凭据归属，不一致时拒绝写入。原账号和 API Key 首次启动自动迁入；旧版 `management/state.json` 与 `metrics.json` 会在首次启动时导入数据库，成功后删除原文件。
@@ -48,6 +48,7 @@
 | `MANAGEMENT_DATA_DIR` | 同 `ADMIN_DIR`，兼容旧部署；两者都设置时 `ADMIN_DIR` 优先 | — |
 | `CODEBUDDY_AUTH_DIR` | 登录凭据目录 | `<当前运行目录>/auth` |
 | `PORT` | 监听端口 | `8787` |
+| `ADMIN_SECURE_COOKIE` | 会话 Cookie 是否加 `Secure` 标志；HTTPS 反代对外时建议设 `1` | `0`（关闭，便于纯 HTTP / 局域网访问） |
 
 容器部署仍可沿用旧值：`deploy/admin/docker-compose.yml` 显式传入 `CODEBUDDY_AUTH_DIR=/data/auth`、`MANAGEMENT_DATA_DIR=/data/management`，显式环境变量优先级更高，行为不变。
 
@@ -60,10 +61,12 @@
 ```bash
 cp deploy/admin/env.example .env
 # 编辑 .env，分别填写随机管理密钥和客户端 API Key
-docker compose -f deploy/admin/docker-compose.yml up -d --build
+docker compose -f deploy/admin/docker-compose.yml --env-file .env up -d --build
 ```
 
-配置 Nginx HTTPS 后再登录：管理会话使用 Secure Cookie，不支持通过普通 HTTP 登录。可参考 `deploy/admin/nginx.conf.example` 配置反向代理和 `/responses` 兼容入口。该文件是 server 块内部的片段，需要自行配置域名和 TLS 证书。
+> `docker compose -f <file>` 默认从**该文件所在目录**读取 `.env`，因此需显式加 `--env-file .env`（或把 `.env` 放在 `deploy/admin/` 下）。
+
+配置 Nginx HTTPS 后再对外提供服务：默认 `ADMIN_SECURE_COOKIE=0`，纯 HTTP 也能登录；若走 HTTPS 反向代理，建议在 `.env` 中设置 `ADMIN_SECURE_COOKIE=1`，让会话 Cookie 带上 `Secure` 标志。可参考 `deploy/admin/nginx.conf.example` 配置反向代理和 `/responses` 兼容入口。该文件是 server 块内部的片段，需要自行配置域名和 TLS 证书。
 
 账号和管理数据均挂载持久化，重建容器不会丢失。不要把 `.env`、`auth/` 或 `management/` 上传到 GitHub。新环境没有凭据时，可以先登录后台再导入账号。
 

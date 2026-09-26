@@ -338,22 +338,27 @@ bash deploy/one-click/deploy.sh
 
 ```bash
 cp deploy/admin/env.example .env   # 填写 ADMIN_KEY 与 CODEBUDDY2OPENAI_KEY
-docker compose -f deploy/admin/docker-compose.yml up -d --build
+docker compose -f deploy/admin/docker-compose.yml --env-file .env up -d --build
 ```
+
+> `docker compose -f <file>` 默认从**该文件所在目录**读取 `.env`，而非当前目录；因此必须显式加 `--env-file .env`（或把 `.env` 放到 `deploy/admin/` 下）。
 
 ### 相关环境变量
 
-取值规则（从高到低）：命令行参数 → 进程环境变量 → `.env` 文件 → 默认值（当前运行目录）。
+取值规则（从高到低）：显式参数 → 进程环境变量 → `.env` 文件 → 默认值（当前运行目录）。
 
 服务会自行加载当前运行目录下的 `.env`（可用 `MYWB_ENV_FILE` 指定其它文件，`MYWB_SKIP_DOTENV=1` 关闭），不必经过 `run.ps1`。
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
-| `CODEBUDDY_AUTH_DIR` | 指定登录态目录（设置后不再回落到桌面端自动发现） | `<当前运行目录>/auth`，未找到时回落桌面端目录 |
-| `CODEBUDDY2OPENAI_KEY` | 本地 API Key | 空 |
-| `CODEBUDDY2OPENAI_LOG` | 日志路径 | 不记日志 |
+| `ADMIN_KEY` | 管理后台密钥，至少 20 字符（**必填**，缺失则启动失败） | 无 |
+| `CODEBUDDY2OPENAI_KEY` | 首次迁入的客户端 API Key；初始化后以库内密钥列表为准 | 空 |
+| `ADMIN_DIR` | 数据目录：SQLite 数据库 `mywb.db` 与凭据元数据 | 当前运行目录 |
+| `MANAGEMENT_DATA_DIR` | 同 `ADMIN_DIR`（兼容旧部署）；两者都设置时 `ADMIN_DIR` 优先 | — |
+| `CODEBUDDY_AUTH_DIR` | 登录态目录（设置后不再回落到桌面端自动发现） | `<当前运行目录>/auth`，未找到时回落桌面端目录 |
 | `PORT` | 监听端口 | `8787` |
-| `CODEBUDDY_REASONING` | 是否向前端透出模型思考过程，默认 `1`（开启）；设 `0` 关闭 | `1` |
+| `ADMIN_SECURE_COOKIE` | 会话 Cookie 是否加 `Secure` 标志；HTTPS 反代对外时建议设 `1` | `0`（关闭，便于纯 HTTP / 局域网访问） |
+| `CODEBUDDY_REASONING` | 是否向前端透出模型思考过程；设 `0` 关闭 | `1` |
 
 ---
 

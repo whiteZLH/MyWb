@@ -28,5 +28,6 @@ if [ "$GENERATED" = "1" ]; then
   echo "  管理密钥  ADMIN_KEY            : $(grep '^ADMIN_KEY=' .env | cut -d= -f2)"
   echo "  客户端 Key CODEBUDDY2OPENAI_KEY : $(grep '^CODEBUDDY2OPENAI_KEY=' .env | cut -d= -f2)"
   echo
-  echo "提示：管理会话 Cookie 带 Secure 标志，正式对外部署请通过 HTTPS 反向代理访问（示例见 deploy/admin/nginx.conf.example）。"
+  echo "提示：默认仅监听本机回环，纯 HTTP 即可登录。正式对外部署请在前面加 HTTPS 反向代理"
+  echo "      （示例见 deploy/admin/nginx.conf.example），并在 .env 中设置 ADMIN_SECURE_COOKIE=1。"
 fi
