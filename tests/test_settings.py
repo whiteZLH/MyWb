@@ -220,7 +220,7 @@ def test_management_data_dir_is_legacy_alias(isolated_env, tmp_path, monkeypatch
 
 
 def test_create_app_autodiscovers_cwd_dotenv(isolated_env, tmp_path, monkeypatch):
-    """回归：`python -m admin.server` 不经 run.ps1 也应读到 cwd/.env。"""
+    """回归：`python -m admin.server` 不经启动脚本也应读到 cwd/.env。"""
     import admin.server as admin_server
 
     monkeypatch.chdir(tmp_path)

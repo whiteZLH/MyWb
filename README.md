@@ -108,16 +108,23 @@ pip install -r requirements.txt
 
 项目只有一个运行入口：管理后台 `admin.server`（协议转换核心作为 ASGI 应用被它挂载，不再单独运行）。
 
-先准备一个 `.env`（可直接复制示例），至少填一个随机管理密钥：
+**一键启动（推荐）**：脚本首次运行会自动生成 `.env`（随机 `ADMIN_KEY` 与客户端 Key），随后启动服务；数据与登录态都落在当前目录。
+
+```bash
+# Linux / macOS
+bash start.sh
+
+# Windows PowerShell
+.\start.ps1
+```
+
+重复运行会直接启动，不会覆盖已有 `.env`。想自定义端口或开关，编辑生成的 `.env`（参考 `.env.example`）。
+
+**手动启动**：自行准备 `.env` 再启动。
 
 ```bash
 cp .env.example .env
 # 编辑 .env，填写 ADMIN_KEY（至少 20 字符）与可选的客户端 Key
-```
-
-然后启动：
-
-```bash
 python3 -m admin.server
 ```
 
@@ -347,7 +354,7 @@ docker compose -f deploy/admin/docker-compose.yml --env-file .env up -d --build
 
 取值规则（从高到低）：显式参数 → 进程环境变量 → `.env` 文件 → 默认值（当前运行目录）。
 
-服务会自行加载当前运行目录下的 `.env`（可用 `MYWB_ENV_FILE` 指定其它文件，`MYWB_SKIP_DOTENV=1` 关闭），不必经过 `run.ps1`。
+服务会自行加载当前运行目录下的 `.env`（可用 `MYWB_ENV_FILE` 指定其它文件，`MYWB_SKIP_DOTENV=1` 关闭），不必经过 `start.ps1` / `start.sh`。
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|

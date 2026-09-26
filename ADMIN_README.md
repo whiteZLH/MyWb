@@ -35,7 +35,7 @@
 
 1. 显式参数（函数 / 命令行传入）
 2. 进程环境变量
-3. `.env` 文件（`python -m admin.server` 会自行加载，不再依赖 `run.ps1`）
+3. `.env` 文件（`python -m admin.server` 会自行加载，不再依赖 `start.ps1` / `start.sh`）
 4. 默认值 —— 一律以**当前运行目录**为基准
 
 `.env` 查找顺序：`$MYWB_ENV_FILE` 指定的文件 → `<当前运行目录>/.env`。其中相对路径一律相对当前运行目录解析。设置 `MYWB_SKIP_DOTENV=1` 可关闭自动加载（测试用）。

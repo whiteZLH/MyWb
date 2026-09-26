@@ -1,6 +1,6 @@
 """统一配置层（零依赖）。
 
-此前 .env 只由 run.ps1 读取并注入进程环境变量，导致 `python -m admin.server`
+此前 .env 只由本地启动脚本读取并注入进程环境变量，导致 `python -m admin.server`
 这类直接启动方式完全读不到 .env。本模块在 Python 侧补上这一层，使两种启动
 方式行为一致。
 
@@ -22,7 +22,7 @@
 - .env 的值只在“进程环境变量缺失”时写入 ``os.environ``，因此
   “环境变量 > .env”天然成立；显式参数由各调用点用 ``param or get(...)`` 保证。
 - .env 中出现的相对路径一律相对 cwd 解析，避免“相对 .env 所在目录”的歧义。
-- 解析规则与 run.ps1 保持一致：跳过空行与 ``#`` 注释、支持 ``export KEY=VALUE``、
+- 解析规则：跳过空行与 ``#`` 注释、支持 ``export KEY=VALUE``、
   去掉值两侧成对的引号；不做变量展开，保证行为可预测。
 - 进程内只加载一次；``MYWB_SKIP_DOTENV=1`` 可彻底关闭（测试用）。
 """
@@ -49,7 +49,7 @@ def cwd() -> Path:
 
 
 def parse_env_text(text: str) -> dict[str, str]:
-    """解析 .env 文本，规则与 run.ps1 对齐。"""
+    """解析 .env 文本（跳过空行与注释、支持 export、去掉成对引号）。"""
     values: dict[str, str] = {}
     for raw in text.splitlines():
         line = raw.strip()
