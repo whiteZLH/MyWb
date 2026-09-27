@@ -1,37 +1,47 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # MyWb 一键部署：自动生成密钥、构建镜像、启动管理后台。
-# 用法：bash deploy/one-click/deploy.sh
+# 用法：sh deploy/one-click/deploy.sh
+#
+# 本脚本只用 POSIX sh 语法，OpenWrt 的 busybox ash 可直接运行，无需安装 bash。
 #
 # 数据默认落系统目录（默认 /opt/mywb），与代码仓库分离，
 # 避免 git clean / 删除仓库 / 重新 clone 时连数据与密钥一起丢失。
 # 可用环境变量覆盖：
-#   MYWB_HOME=/your/path bash deploy.sh      数据目录（默认 /opt/mywb）
-# 也可用 -f 指定自定义 compose 文件（通常配合下面的 override 示例）：
-#   bash deploy.sh -f docker-compose.custom.yml
-set -euo pipefail
+#   MYWB_HOME=/your/path sh deploy.sh        数据目录（默认 /opt/mywb）
+# 也可用 -f 指定自定义 compose 文件（须作为第一个参数）：
+#   sh deploy.sh -f docker-compose.custom.yml
+set -eu
+
 cd "$(dirname "$0")"
 ROOT="$PWD"
 
 case "${1:-}" in
   -h|--help)
     cat <<'EOF'
-用法：bash deploy.sh [-f <compose 文件>] [docker compose 透传参数]
-  -f, --file  指定 compose 文件（默认 docker-compose.yml）
+用法：sh deploy.sh [-f <compose 文件>] [docker compose 透传参数]
+  -f, --file  指定 compose 文件（默认 docker-compose.yml，须放在第一个参数）
   MYWB_HOME   数据目录，默认 /opt/mywb（可写 /etc/mywb/mywb.env 持久覆盖）
 EOF
     exit 0 ;;
 esac
 
-# 数据目录：显式覆盖 > /etc/mywb/mywb.env > compose 默认 /opt/mywb
+# 数据目录：显式环境变量 > /etc/mywb/mywb.env > 默认 /opt/mywb
 if [ -z "${MYWB_HOME:-}" ] && [ -f /etc/mywb/mywb.env ]; then
   # shellcheck disable=SC1091
   . /etc/mywb/mywb.env
 fi
 DATA_DIR="${MYWB_HOME:-/opt/mywb}"
-export MYWB_HOME="$DATA_DIR"
+MYWB_HOME="$DATA_DIR"
+export MYWB_HOME
 ENV_FILE="$DATA_DIR/.env"
 COMPOSE_FILE="docker-compose.yml"
-COMPOSE_ARGS=()
+
+# -f/--file 只识别为第一个参数，其余参数原样透传给 docker compose up
+if [ "${1:-}" = "-f" ] || [ "${1:-}" = "--file" ]; then
+  [ -n "${2:-}" ] || { echo "错误：$1 需要一个参数。" >&2; exit 1; }
+  COMPOSE_FILE="$2"
+  shift 2
+fi
 
 # ---------- 前置检查 ----------
 if ! command -v docker >/dev/null 2>&1; then
@@ -49,16 +59,22 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 # ---------- 目录初始化（失败多为权限不足） ----------
-mkdir -p "$DATA_DIR" 2>/dev/null || {
-  echo "错误：无法创建数据目录 $DATA_DIR，请用 sudo 运行，或设置 MYWB_HOME 指向可写目录。" >&2
-  echo "      示例：MYWB_HOME=\$HOME/mywb bash deploy.sh" >&2
+if ! mkdir -p "$DATA_DIR" 2>/dev/null; then
+  echo "错误：无法创建数据目录 $DATA_DIR，请用 root 运行，或设置 MYWB_HOME 指向可写目录。" >&2
+  echo "      示例：MYWB_HOME=\$HOME/mywb sh deploy.sh" >&2
   exit 1
-}
+fi
 
-# 生成 URL 安全的随机串（优先 Python，回落到 openssl）
+# 生成 URL 安全的随机串。显式判断命令是否存在：POSIX sh 无 pipefail，
+# 用 `cmd | head` 的管道返回值会掩盖 cmd 失败，故不能靠 `||` 回落。
 rand() {
-  python3 -c "import secrets; print(secrets.token_urlsafe($1))" 2>/dev/null \
-    || openssl rand -base64 48 | tr -dc 'A-Za-z0-9_-' | head -c "$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c "import secrets; print(secrets.token_urlsafe($1))"
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl rand -base64 48 | tr -dc 'A-Za-z0-9_-' | head -c "$1"
+  else
+    head -c 96 /dev/urandom | tr -dc 'A-Za-z0-9_-' | head -c "$1"
+  fi
 }
 
 GENERATED=0
@@ -74,34 +90,27 @@ fi
 # 对同机其它用户可读；server 侧 mkdir(mode=0o700) 对「已存在」目录不生效，
 # 所以必须在这里先建好。非 root 且目录归属其它用户时降级为提示，不阻断部署。
 mkdir -p "$DATA_DIR/auth" "$DATA_DIR/management"
-chmod 700 "$DATA_DIR" "$DATA_DIR/auth" "$DATA_DIR/management" 2>/dev/null || \
-  echo "提示：未能收紧 $DATA_DIR 权限（可能非 root），如为多用户主机请手动 chmod 700。" >&2
+chmod 700 "$DATA_DIR" "$DATA_DIR/auth" "$DATA_DIR/management" 2>/dev/null \
+  || echo "提示：未能收紧 $DATA_DIR 权限（可能非 root），如为多用户主机请手动 chmod 700。" >&2
 
-# ---------- 参数解析 ----------
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -f|--file)
-      [ -n "${2:-}" ] || { echo "错误：$1 需要一个参数。" >&2; exit 1; }
-      COMPOSE_FILE="$2"; shift 2 ;;
-    *)
-      COMPOSE_ARGS+=("$1"); shift ;;
-  esac
-done
-
-docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --build "${COMPOSE_ARGS[@]}"
+docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --build "$@"
 
 PORT="$(grep '^PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]' || true)"
 PORT="${PORT:-8787}"
 
-# 探测本机局域网地址，便于同网段设备直接访问
+# 探测本机局域网地址，便于同网段设备直接访问（逐级回落，输出非空才采用）
 lan_ip() {
+  _out=""
   if command -v ip >/dev/null 2>&1; then
-    ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 && return
+    _out="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)"
   fi
-  if command -v hostname >/dev/null 2>&1; then
-    hostname -I 2>/dev/null | tr ' ' '\n' | grep -v '^$' | head -n1 && return
+  if [ -z "$_out" ] && command -v hostname >/dev/null 2>&1; then
+    _out="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -v '^$' | head -n1)"
   fi
-  ifconfig 2>/dev/null | awk '/inet /{print $2}' | grep -v '^127\.' | head -n1
+  if [ -z "$_out" ] && command -v ifconfig >/dev/null 2>&1; then
+    _out="$(ifconfig 2>/dev/null | awk '/inet /{print $2}' | grep -v '^127\.' | head -n1)"
+  fi
+  printf '%s' "$_out"
 }
 LANIP="$(lan_ip || true)"
 LANIP="${LANIP:-<本机IP>}"

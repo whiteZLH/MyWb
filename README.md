@@ -331,10 +331,10 @@ python3 -m admin.server
 
 ### 一键部署（推荐）
 
-一条命令完成密钥生成、镜像构建与启动：
+一条命令完成密钥生成、镜像构建与启动（脚本为 POSIX sh，OpenWrt 等无 bash 环境可直接运行）：
 
 ```bash
-bash deploy/one-click/deploy.sh
+sh deploy/one-click/deploy.sh
 ```
 
 脚本会自动生成 `ADMIN_KEY` 与客户端 Key，首次部署时会打印一次（保存在 `$MYWB_HOME/.env`，默认 `/opt/mywb/.env`），随后访问 `http://127.0.0.1:8787/admin/`（同网段设备可用脚本打印的局域网地址访问）。改端口：编辑 `$MYWB_HOME/.env` 里的 `PORT` 后重跑脚本；停止：`docker compose -f deploy/one-click/docker-compose.yml --env-file /opt/mywb/.env down`。
@@ -347,7 +347,7 @@ bash deploy/one-click/deploy.sh
 | `/opt/mywb/auth` | `/data/auth` | 账号登录态（`*.info` 凭据） |
 | `/opt/mywb/management` | `/data/management` | SQLite 数据库 `mywb.db`、账号索引、API Key 摘要、请求统计 |
 
-> 数据默认目录在 OpenWrt 上选的是 `/opt/mywb`（overlay/extroot 持久化）而非 `/var` —— 部分 OpenWrt 的 `/var` 是 tmpfs，重启即失。用 `MYWB_HOME=/your/path bash deploy.sh` 可改；把 `MYWB_HOME=/your/path` 写入 `/etc/mywb/mywb.env` 可持久生效。
+> 数据默认目录在 OpenWrt 上选的是 `/opt/mywb`（overlay/extroot 持久化）而非 `/var` —— 部分 OpenWrt 的 `/var` 是 tmpfs，重启即失。用 `MYWB_HOME=/your/path sh deploy.sh` 可改；把 `MYWB_HOME=/your/path` 写入 `/etc/mywb/mywb.env` 可持久生效。
 
 > **网络模式**：一键部署使用 `network_mode: host`（容器直接监听宿主机端口，不经 Docker 的 DNAT 转发），以兼容 OpenWrt 等 `fw4`/nftables 防火墙环境——在那些环境下端口映射产生的「转发流量」会被 forward 链丢弃，表现为宿主机能访问、局域网客户端超时。注意 **Docker Desktop（Windows / macOS）对 host 网络支持有限**：此时请把 compose 里的 `network_mode: host` 换回端口映射 `ports: ["${PORT:-8787}:8787"]`。OpenWrt 下若因数据目录在 `/opt` 等路径出现挂载问题，可临时加 `security_opt: ["label=disable"]`。
 
@@ -544,7 +544,7 @@ Use `/v1/messages`:
 
 - desensitization is enabled by default in the admin console
 - `/v1/responses` already applies backend-facing projection by default
-- the Chinese web admin console (`python3 -m admin.server`, see [ADMIN_README.md](ADMIN_README.md)) is the single entry point and adds browser-based account authorization, multi-account rotation, client API keys, daily check-in and request metrics; one-command Docker setup: `bash deploy/one-click/deploy.sh`
+- the Chinese web admin console (`python3 -m admin.server`, see [ADMIN_README.md](ADMIN_README.md)) is the single entry point and adds browser-based account authorization, multi-account rotation, client API keys, daily check-in and request metrics; one-command Docker setup: `sh deploy/one-click/deploy.sh`
 
 ### Disclaimer
 
