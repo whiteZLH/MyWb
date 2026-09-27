@@ -29,11 +29,15 @@ auth/
 management/
 backups/
 deploy/one-click/data/
+# Compose 自动加载的用户本地覆盖文件（环境相关，可能含个人路径/密钥，不入库）
+docker-compose.override.yml
+docker-compose.override.yaml
 wheels/
 *.info
 *.tar.gz
 management-access.txt
 .idea/
+.vscode/
 
 # 管理后台运行时数据（ADMIN_DIR 指向项目根目录时会产生在这里）
 # mywb.db 为 SQLite 数据库，保存账号索引、API Key 摘要、会话与请求记录，不得提交。

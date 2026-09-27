@@ -319,7 +319,7 @@ python3 -m admin.server
 
 然后访问 `http://127.0.0.1:8787/admin/`。一键 Docker 部署见下文；详细说明见 [ADMIN_README.md](ADMIN_README.md)。
 
-> 管理后台为单进程设计，正式对外部署必须放在 HTTPS 反向代理之后（示例：`deploy/admin/nginx.conf.example`）。
+> 管理后台为单进程设计。一键 Docker 部署默认监听所有网卡（`network_mode: host`，或端口映射也可），**局域网内任意设备都能打开管理后台，且为明文 HTTP**；跨不可信网络务必放在 HTTPS 反向代理之后（示例：`deploy/admin/nginx.conf.example`）并设置 `ADMIN_SECURE_COOKIE=1`。
 
 ---
 
@@ -337,7 +337,19 @@ python3 -m admin.server
 bash deploy/one-click/deploy.sh
 ```
 
-脚本会自动生成 `ADMIN_KEY` 与客户端 Key（保存在 `deploy/one-click/.env`，仅首次显示），随后访问 `http://127.0.0.1:8787/admin/`。改端口：编辑 `deploy/one-click/.env` 里的 `PORT` 后重跑脚本。
+脚本会自动生成 `ADMIN_KEY` 与客户端 Key，首次部署时会打印一次（保存在 `$MYWB_HOME/.env`，默认 `/opt/mywb/.env`），随后访问 `http://127.0.0.1:8787/admin/`（同网段设备可用脚本打印的局域网地址访问）。改端口：编辑 `$MYWB_HOME/.env` 里的 `PORT` 后重跑脚本；停止：`docker compose -f deploy/one-click/docker-compose.yml --env-file /opt/mywb/.env down`。
+
+数据默认落**系统目录**（`/opt/mywb`，可用 `MYWB_HOME` 覆盖），与代码仓库分离，避免 `git clean` / 删除仓库 / 重新 clone 时连数据与密钥一起丢失。
+
+| 宿主机（默认） | 容器内 | 内容 |
+|--------|--------|------|
+| `/opt/mywb/.env` | `/app/.env`（只读） | 配置；容器启动时由 `core/settings.py` 自动加载，`PORT` 等开关均生效 |
+| `/opt/mywb/auth` | `/data/auth` | 账号登录态（`*.info` 凭据） |
+| `/opt/mywb/management` | `/data/management` | SQLite 数据库 `mywb.db`、账号索引、API Key 摘要、请求统计 |
+
+> 数据默认目录在 OpenWrt 上选的是 `/opt/mywb`（overlay/extroot 持久化）而非 `/var` —— 部分 OpenWrt 的 `/var` 是 tmpfs，重启即失。用 `MYWB_HOME=/your/path bash deploy.sh` 可改；把 `MYWB_HOME=/your/path` 写入 `/etc/mywb/mywb.env` 可持久生效。
+
+> **网络模式**：一键部署使用 `network_mode: host`（容器直接监听宿主机端口，不经 Docker 的 DNAT 转发），以兼容 OpenWrt 等 `fw4`/nftables 防火墙环境——在那些环境下端口映射产生的「转发流量」会被 forward 链丢弃，表现为宿主机能访问、局域网客户端超时。注意 **Docker Desktop（Windows / macOS）对 host 网络支持有限**：此时请把 compose 里的 `network_mode: host` 换回端口映射 `ports: ["${PORT:-8787}:8787"]`。OpenWrt 下若因数据目录在 `/opt` 等路径出现挂载问题，可临时加 `security_opt: ["label=disable"]`。
 
 ### docker compose（手动）
 

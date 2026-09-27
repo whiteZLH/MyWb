@@ -7,22 +7,41 @@ services:
     image: local/mywb:one-click
     container_name: mywb-oneclick
     restart: unless-stopped
-    ports:
-      # 监听所有网卡，允许局域网直连；若只想本机访问，改回 "127.0.0.1:${PORT:-8787}:8787"
-      - "${PORT:-8787}:8787"
+    # 使用宿主网络栈：容器直接监听宿主机端口，不经 Docker 的 DNAT 转发。
+    # 原因：在 OpenWrt(fw4/nftables) 等环境里，DNAT 会把入站流量变成「转发流量」，
+    # 而 fw4 的 forward 链 policy 为 drop、Docker 网桥又不属于任何 zone，包会被丢弃
+    # （典型现象：宿主机自己能访问，局域网客户端超时）。走 host 网络后，
+    # 局域网访问是普通 INPUT 流量，命中 lan zone 的 ACCEPT，从根上避免该问题。
+    # 注意：Docker Desktop（Windows / macOS）对 host 网络支持有限，改用端口映射即可，见 README。
+    network_mode: host
     environment:
       ADMIN_KEY: ${ADMIN_KEY:?请先运行 deploy.sh 自动生成，或参考 env.example 手动创建 .env}
       CODEBUDDY2OPENAI_KEY: ${CODEBUDDY2OPENAI_KEY:?请先运行 deploy.sh 自动生成，或参考 env.example 手动创建 .env}
       CODEBUDDY_AUTH_DIR: /data/auth
       MANAGEMENT_DATA_DIR: /data/management
       TZ: Asia/Shanghai
+      # host 模式没有端口映射，监听端口只能由应用自己决定，因此必须显式透传。
+      # 端口映射模式下同样传：容器监听 PORT、宿主机也映射 PORT，两种模式行为一致。
+      PORT: ${PORT:-8787}
       # 会话 Cookie 的 Secure 标志；HTTPS 反代对外时在 .env 设为 1
       ADMIN_SECURE_COOKIE: ${ADMIN_SECURE_COOKIE:-0}
     volumes:
-      - ./data/auth:/data/auth
-      - ./data/management:/data/management
+      # 数据默认落系统目录 $MYWB_HOME（默认 /opt/mywb），与代码仓库分离，
+      # 避免 git clean / 删仓库 / 重新 clone 时连数据与密钥一起丢失。
+      # 账号登录态（*.info 凭据）
+      - ${MYWB_HOME:-/opt/mywb}/auth:/data/auth
+      # SQLite 数据库 mywb.db、账号索引、API Key 摘要、会话与请求统计
+      - ${MYWB_HOME:-/opt/mywb}/management:/data/management
+      # 配置：容器内 /app/.env 由 core/settings.py 自动加载，
+      # 因此 .env 里除下方 environment 之外的开关（如 CODEBUDDY_REASONING）同样生效。
+      - ${MYWB_HOME:-/opt/mywb}/.env:/app/.env:ro
+    # OpenWrt 等若数据目录位于 /opt 挂载点、容器无法读取挂载卷时，取消下一行注释：
+    # security_opt:
+    #   - label=disable
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=5)"]
+      # 端口跟随 PORT，否则改端口后健康检查永远失败
+      test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:${PORT:-8787}/health\", timeout=5)'"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 20s

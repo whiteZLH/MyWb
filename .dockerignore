@@ -1,12 +1,56 @@
+# 构建上下文瘦身：Dockerfile 只 COPY requirements.txt / core / admin，
+# 其余一律不进上下文，避免每次 --build 白传数百 MB 本地目录。
 .git
+.gitignore
 .idea
+.opencode
+.claude
+.codex
+
+# Python 虚拟环境与缓存
+.venv
+venv
+env
 __pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+
+# 前端源码与依赖、构建缓存（admin/static 为已构建产物，随源码提交）
+web/node_modules
+web/dist
+web/.vite
+.vite
+node_modules
+
+# 测试与调试残留
+tests
+conftest.py
+_*.py
+_*.sse
+_*.txt
+_*.err
+_*.out
+preview_admin.py
+
+# 本地运行产物
+*.log
+*.tar.gz
+*.pid
+wheels
+backups
+.pytest_cache
+
+# 密钥与运行时数据：绝不进镜像
 .env
+.env.*
+!.env.example
+**/.env
 auth
 management
-backups
-wheels
-*.tar.gz
-*.log
-*.env
-preview_admin.py
+deploy/one-click/data
+mywb.db
+mywb.db-*
+state.json
+metrics.json
+*.info

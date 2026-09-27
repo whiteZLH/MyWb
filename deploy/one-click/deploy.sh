@@ -1,33 +1,128 @@
 #!/usr/bin/env bash
 # MyWb 一键部署：自动生成密钥、构建镜像、启动管理后台。
 # 用法：bash deploy/one-click/deploy.sh
+#
+# 数据默认落系统目录（默认 /opt/mywb），与代码仓库分离，
+# 避免 git clean / 删除仓库 / 重新 clone 时连数据与密钥一起丢失。
+# 可用环境变量覆盖：
+#   MYWB_HOME=/your/path bash deploy.sh      数据目录（默认 /opt/mywb）
+# 也可用 -f 指定自定义 compose 文件（通常配合下面的 override 示例）：
+#   bash deploy.sh -f docker-compose.custom.yml
 set -euo pipefail
 cd "$(dirname "$0")"
+ROOT="$PWD"
 
-rand() { python3 -c "import secrets; print(secrets.token_urlsafe($1))" 2>/dev/null || openssl rand -base64 48 | tr -dc 'A-Za-z0-9_-' | head -c "$1"; }
+case "${1:-}" in
+  -h|--help)
+    cat <<'EOF'
+用法：bash deploy.sh [-f <compose 文件>] [docker compose 透传参数]
+  -f, --file  指定 compose 文件（默认 docker-compose.yml）
+  MYWB_HOME   数据目录，默认 /opt/mywb（可写 /etc/mywb/mywb.env 持久覆盖）
+EOF
+    exit 0 ;;
+esac
+
+# 数据目录：显式覆盖 > /etc/mywb/mywb.env > compose 默认 /opt/mywb
+if [ -z "${MYWB_HOME:-}" ] && [ -f /etc/mywb/mywb.env ]; then
+  # shellcheck disable=SC1091
+  . /etc/mywb/mywb.env
+fi
+DATA_DIR="${MYWB_HOME:-/opt/mywb}"
+export MYWB_HOME="$DATA_DIR"
+ENV_FILE="$DATA_DIR/.env"
+COMPOSE_FILE="docker-compose.yml"
+COMPOSE_ARGS=()
+
+# ---------- 前置检查 ----------
+if ! command -v docker >/dev/null 2>&1; then
+  echo "错误：未找到 docker，请先安装 Docker。" >&2
+  exit 1
+fi
+if ! docker compose version >/dev/null 2>&1; then
+  echo "错误：未找到 docker compose（v2 插件）。" >&2
+  echo "      Docker Compose v1 请改用 docker-compose，或升级到 v2。" >&2
+  exit 1
+fi
+if ! docker info >/dev/null 2>&1; then
+  echo "错误：Docker 守护进程不可用（docker info 失败），请先启动 dockerd / Docker Desktop。" >&2
+  exit 1
+fi
+
+# ---------- 目录初始化（失败多为权限不足） ----------
+mkdir -p "$DATA_DIR" 2>/dev/null || {
+  echo "错误：无法创建数据目录 $DATA_DIR，请用 sudo 运行，或设置 MYWB_HOME 指向可写目录。" >&2
+  echo "      示例：MYWB_HOME=\$HOME/mywb bash deploy.sh" >&2
+  exit 1
+}
+
+# 生成 URL 安全的随机串（优先 Python，回落到 openssl）
+rand() {
+  python3 -c "import secrets; print(secrets.token_urlsafe($1))" 2>/dev/null \
+    || openssl rand -base64 48 | tr -dc 'A-Za-z0-9_-' | head -c "$1"
+}
 
 GENERATED=0
-if [ ! -f .env ]; then
+if [ ! -f "$ENV_FILE" ]; then
   ADMIN_KEY="$(rand 36)"
   CLIENT_KEY="sk-wb-$(rand 32)"
-  printf 'ADMIN_KEY=%s\nCODEBUDDY2OPENAI_KEY=%s\nPORT=8787\n' "$ADMIN_KEY" "$CLIENT_KEY" > .env
-  chmod 600 .env
+  printf 'ADMIN_KEY=%s\nCODEBUDDY2OPENAI_KEY=%s\nPORT=8787\n' "$ADMIN_KEY" "$CLIENT_KEY" > "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
   GENERATED=1
 fi
 
-docker compose --env-file .env up -d --build "$@"
+# 数据子目录：Docker 自动创建的 bind 目录默认 0755，会让 auth/*.info（含 token）
+# 对同机其它用户可读；server 侧 mkdir(mode=0o700) 对「已存在」目录不生效，
+# 所以必须在这里先建好。非 root 且目录归属其它用户时降级为提示，不阻断部署。
+mkdir -p "$DATA_DIR/auth" "$DATA_DIR/management"
+chmod 700 "$DATA_DIR" "$DATA_DIR/auth" "$DATA_DIR/management" 2>/dev/null || \
+  echo "提示：未能收紧 $DATA_DIR 权限（可能非 root），如为多用户主机请手动 chmod 700。" >&2
 
-PORT="$(grep '^PORT=' .env 2>/dev/null | cut -d= -f2 || true)"
+# ---------- 参数解析 ----------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -f|--file)
+      [ -n "${2:-}" ] || { echo "错误：$1 需要一个参数。" >&2; exit 1; }
+      COMPOSE_FILE="$2"; shift 2 ;;
+    *)
+      COMPOSE_ARGS+=("$1"); shift ;;
+  esac
+done
+
+docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --build "${COMPOSE_ARGS[@]}"
+
+PORT="$(grep '^PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]' || true)"
 PORT="${PORT:-8787}"
 
+# 探测本机局域网地址，便于同网段设备直接访问
+lan_ip() {
+  if command -v ip >/dev/null 2>&1; then
+    ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 && return
+  fi
+  if command -v hostname >/dev/null 2>&1; then
+    hostname -I 2>/dev/null | tr ' ' '\n' | grep -v '^$' | head -n1 && return
+  fi
+  ifconfig 2>/dev/null | awk '/inet /{print $2}' | grep -v '^127\.' | head -n1
+}
+LANIP="$(lan_ip || true)"
+LANIP="${LANIP:-<本机IP>}"
+
 echo
-echo "管理后台已启动：http://127.0.0.1:${PORT}/admin/"
+echo "管理后台已启动："
+echo "  本机       http://127.0.0.1:${PORT}/admin/"
+echo "  局域网     http://${LANIP}:${PORT}/admin/"
 if [ "$GENERATED" = "1" ]; then
   echo
-  echo "首次部署已生成密钥（同时保存在 deploy/one-click/.env，仅创建时显示一次）："
-  echo "  管理密钥  ADMIN_KEY            : $(grep '^ADMIN_KEY=' .env | cut -d= -f2)"
-  echo "  客户端 Key CODEBUDDY2OPENAI_KEY : $(grep '^CODEBUDDY2OPENAI_KEY=' .env | cut -d= -f2)"
-  echo
-  echo "提示：默认仅监听本机回环，纯 HTTP 即可登录。正式对外部署请在前面加 HTTPS 反向代理"
-  echo "      （示例见 deploy/admin/nginx.conf.example），并在 .env 中设置 ADMIN_SECURE_COOKIE=1。"
+  echo "首次部署已生成密钥（同时保存在 $ENV_FILE，仅创建时显示一次）："
+  echo "  管理密钥   ADMIN_KEY            : $(grep '^ADMIN_KEY=' "$ENV_FILE" | cut -d= -f2)"
+  echo "  客户端 Key CODEBUDDY2OPENAI_KEY : $(grep '^CODEBUDDY2OPENAI_KEY=' "$ENV_FILE" | cut -d= -f2)"
 fi
+echo
+echo "持久化目录（与代码仓库分离，删仓库/重新 clone 不影响）："
+echo "  $DATA_DIR/.env                配置（改端口/开关后重跑本脚本）"
+echo "  $DATA_DIR/auth/               账号登录态"
+echo "  $DATA_DIR/management/mywb.db  SQLite：账号索引、API Key、统计"
+echo "  设置 MYWB_HOME 可改为其它位置；把 MYWB_HOME=该目录 写入 /etc/mywb/mywb.env 可持久生效。"
+echo
+echo "停止：cd $ROOT && docker compose -f $COMPOSE_FILE --env-file $ENV_FILE down"
+echo "提示：管理后台为明文 HTTP，局域网内任意设备均可访问；跨不可信网络请在前端加 HTTPS"
+echo "      反向代理（示例见 deploy/admin/nginx.conf.example），并设置 ADMIN_SECURE_COOKIE=1。"
