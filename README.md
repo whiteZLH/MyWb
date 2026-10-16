@@ -378,6 +378,22 @@ docker compose -f deploy/admin/docker-compose.yml --env-file .env up -d --build
 | `PORT` | 监听端口 | `8787` |
 | `ADMIN_SECURE_COOKIE` | 会话 Cookie 是否加 `Secure` 标志；HTTPS 反代对外时建议设 `1` | `0`（关闭，便于纯 HTTP / 局域网访问） |
 | `CODEBUDDY_REASONING` | 是否向前端透出模型思考过程；设 `0` 关闭 | `1` |
+| `CODEBUDDY_EGRESS_RPS` / `_BURST` / `_MAX_WAIT` | 上游出口总速率（req/s）与排队上限，防 IP 速率型 WAF/429 | `2` / `1` / `10` |
+| `CODEBUDDY_EGRESS_PROXY` | 全局出口代理（`http(s)://` / `socks5(h)://`）；Docker `-e` 直接配 | 空（直连，仍读 `HTTP(S)_PROXY`/`ALL_PROXY`） |
+| `CODEBUDDY_EGRESS_VLESS` | 全局默认 VLESS 节点（一条 `vless://` 分享链接） | 空 |
+| `CODEBUDDY_VLESS_BIN` | sing-box 内核路径 | 自动在 `PATH` / `/usr/local/bin` 查找 |
+
+### 出站代理与「每账号不同 IP」（VLESS 内置）
+
+镜像**已内置静态 sing-box**（按构建架构自动下载）。给账号配不同节点即可让不同账号走不同出站 IP：
+
+- **全局**：`.env` 里 `CODEBUDDY_EGRESS_VLESS=vless://…`，所有未单独配置的账号都走它；或 `CODEBUDDY_EGRESS_PROXY=http://host:port` 用一个现成 HTTP 代理。
+- **按账号**：面板「账号池」→ 账号行「代理」→ 粘贴该账号自己的 `vless://…` 分享链接。程序会为该节点在本机起一个 sing-box 入站（`127.0.0.1:20808+`），**不同账号填不同链接 → 不同出口 IP**。
+- 也支持直接填 `http(s)://` / `socks5(h)://` 代理（socks5 需自行 `pip install httpx[socks]`）。
+- 出口优先级：**账号级 > `CODEBUDDY_EGRESS_PROXY` > `CODEBUDDY_EGRESS_VLESS` > 直连**；节点起不来会**报错而非静默直连**（避免暴露本机 IP）。
+- 国内构建若拉不动 GitHub：`docker compose build --build-arg SINGBOX_URL_BASE=<镜像/代理前缀>`。
+
+> OpenWrt 上容器用 `network_mode: host`，容器内起的 sing-box 直接监听宿主机回环，账号出站与网关同进程内互通，无需额外端口映射。
 
 ---
 

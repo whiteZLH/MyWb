@@ -10,6 +10,7 @@ import time
 from collections import deque
 from pathlib import Path
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
 import httpx
 import uvicorn
@@ -19,6 +20,8 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from core import converter
 from core import settings
 from core import site_routing
+from core import rate_limit
+from core import vless
 from .browser_login import DEFAULT_SITE, SITE_HOSTS, BrowserLogin
 from .db import Database
 from .pool import AccountPool, PoolMiddleware
@@ -49,6 +52,36 @@ def clean_name(value, fallback):
     if not isinstance(value, str) or not 1 <= len(value.strip()) <= 60:
         raise HTTPException(400, "名称需为 1–60 个字符")
     return value.strip()
+
+
+_PROXY_SCHEMES = ("http", "https", "socks5", "socks5h")
+
+
+def validate_proxy(value):
+    """校验出口代理串：空 = 直连；http(s)/socks5(h) URL；或 vless:// 分享链接。"""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise HTTPException(400, "代理格式不正确")
+    text = value.strip()
+    if not text:
+        return ""
+    if len(text) > 4096 or any(char in text for char in "\r\n\t"):
+        raise HTTPException(400, "代理地址包含无效字符")
+    if text.lower().startswith("vless://"):
+        try:
+            vless.parse_vless_link(text)
+        except ValueError as exc:
+            raise HTTPException(400, f"VLESS 链接无效：{exc}")
+        return text
+    try:
+        parts = urlsplit(text)
+        port_ok = parts.port is None or 0 < parts.port < 65536
+    except ValueError:
+        raise HTTPException(400, "代理端口无效")
+    if parts.scheme not in _PROXY_SCHEMES or not parts.hostname or not port_ok or " " in parts.hostname:
+        raise HTTPException(400, "代理需为 http(s):// 或 socks5(h)://host:port，或 vless:// 链接")
+    return text
 
 
 class Store:
@@ -182,7 +215,7 @@ class Store:
                 raise HTTPException(400, "最多保存 100 个账号")
             aid = secrets.token_hex(8)
             write_json(self.auth_dir / (aid + ".info"), doc)
-            self.data["accounts"][aid] = {"file": aid + ".info", "name": name or str(doc["account"].get("nickname") or "浏览器授权账号")[:60], "created": int(time.time()), "enabled": True}
+            self.data["accounts"][aid] = {"file": aid + ".info", "name": name or str(doc["account"].get("nickname") or "浏览器授权账号")[:60], "created": int(time.time()), "enabled": True, "proxy": "", "never_cooldown": False}
             if self.data["active"] is None:
                 self.data["active"] = aid
             self.save()
@@ -203,13 +236,14 @@ class Store:
     def manager_for(self, aid, item):
         with self.lock:
             if aid not in self.managers:
-                self.managers[aid] = converter.CredentialManager(self.file_for(item))
+                self.managers[aid] = converter.CredentialManager(
+                    self.file_for(item), proxy=item.get("proxy"))
             return self.managers[aid]
 
     def account_rows(self):
         result = []
         for aid, item in self.data["accounts"].items():
-            row = {"id": aid, "name": item["name"], "enabled": item["enabled"], "active": aid == self.data["active"], "created": item["created"], "max_concurrent": int(item.get("max_concurrent") or 0)}
+            row = {"id": aid, "name": item["name"], "enabled": item["enabled"], "active": aid == self.data["active"], "created": item["created"], "max_concurrent": int(item.get("max_concurrent") or 0), "proxy": str(item.get("proxy") or ""), "never_cooldown": bool(item.get("never_cooldown"))}
             try:
                 doc = json.loads(self.file_for(item).read_text(encoding="utf-8"))
                 expiry = doc["auth"].get("expiresAt", 0)
@@ -312,6 +346,15 @@ def resolve_store_paths(root=None, auth_dir=None):
     return data_dir, auth
 
 
+def apply_egress_settings(pool_settings):
+    """把账号池里的出口匀速配置应用到进程级匀速器（启动与保存时调用）。"""
+    rate_limit.PACER.configure(
+        rps=pool_settings.get("egress_rps", 2.0),
+        burst=pool_settings.get("egress_burst", 1),
+        max_wait=pool_settings.get("egress_max_wait", 10.0),
+    )
+
+
 def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secure_cookie=None, db=None):
     data_dir, auth = resolve_store_paths(root, auth_dir)
     if secure_cookie is None:
@@ -324,6 +367,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     converter.CONFIG.update({"desensitize": True, "no_compact": False, "log_path": None})
     browser_login = BrowserLogin(store.save_browser_account)
     pool = AccountPool(store)
+    apply_egress_settings(store.data["pool"])
     metrics = RequestMetrics(database, legacy_path=store.root / "metrics.json")
     @asynccontextmanager
     async def lifespan(app):
@@ -347,6 +391,8 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                     pass  # Per-account errors are persisted without credential data.
                 await asyncio.sleep(60)
         pool_task = asyncio.create_task(pool_worker())
+        # 预热全局 VLESS 节点（失败只记状态，不阻断启动）。
+        await asyncio.to_thread(vless.warmup)
         try:
             yield
         finally:
@@ -367,6 +413,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             except asyncio.CancelledError:
                 pass
             await asyncio.to_thread(metrics.save)
+            await asyncio.to_thread(vless.shutdown)
             if db is None:
                 database.close()
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
@@ -492,7 +539,18 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         store.require_admin(req)
         with store.lock:
             keys = [{"id": kid, **{k: v for k, v in item.items() if k != "hash"}} for kid, item in store.data["keys"].items()]
-            return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "metrics": metrics.snapshot(), "keys": keys, "models": converter.get_available_models(), "uptime": int(time.time() - store.started), "events": list(store.events)}
+            nodes = []
+            for nid, item in store.data["nodes"].items():
+                try:
+                    outbound = vless.parse_vless_link(item["link"])
+                    label = f"{outbound['server']}:{outbound['server_port']}"
+                except ValueError:
+                    label = "(无效链接)"
+                nodes.append({"id": nid, "label": label, "remark": item.get("remark") or "",
+                              "enabled": bool(item.get("enabled")),
+                              "port": vless.NODES.port_for(item["link"]),
+                              "health": vless.NODES.health.get(item["link"])})
+            return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "metrics": metrics.snapshot(), "keys": keys, "models": converter.get_available_models(), "uptime": int(time.time() - store.started), "events": list(store.events), "egress_blocked_seconds": pool.egress_blocked_seconds(), "vless": vless.NODES.status(), "nodes": nodes}
 
     @app.get("/admin/api/stats")
     async def stats(req: Request):
@@ -508,8 +566,10 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     @app.post("/admin/api/accounts/{aid}/actions/{action}")
     async def account_action(aid: str, action: str, req: Request):
         store.require_admin(req)
-        if action not in ("refresh", "status", "checkin"):
+        if action not in ("refresh", "status", "checkin", "uncool"):
             raise HTTPException(404)
+        if action == "uncool":
+            return await asyncio.to_thread(pool.uncool, aid)
         return await asyncio.to_thread(pool.operate, aid, action)
 
     @app.post("/admin/api/pool/actions/{action}")
@@ -538,9 +598,124 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 if not isinstance(body["checkin_time"], str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", body["checkin_time"]):
                     raise HTTPException(400, "请选择有效的签到时间")
                 settings["checkin_time"] = body["checkin_time"]
+            if "egress_rps" in body:
+                value = body["egress_rps"]
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 50:
+                    raise HTTPException(400, "速率上限需为 0–50 的数字（0 表示关闭）")
+                settings["egress_rps"] = float(value)
+            if "egress_burst" in body:
+                value = body["egress_burst"]
+                if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 20:
+                    raise HTTPException(400, "突发槽位需为 1–20 的整数")
+                settings["egress_burst"] = int(value)
+            if "egress_max_wait" in body:
+                value = body["egress_max_wait"]
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 120:
+                    raise HTTPException(400, "排队等待上限需为 0–120 秒")
+                settings["egress_max_wait"] = float(value)
             store.data["pool"] = settings
             store.save()
+        apply_egress_settings(settings)
         return {"ok": True, "pool": settings}
+
+    @app.post("/admin/api/nodes")
+    async def add_nodes(req: Request):
+        store.require_admin(req)
+        body = await payload(req)
+        text = body.get("text")
+        if not isinstance(text, str):
+            raise HTTPException(400, "请提供节点文本（每行一条 vless:// 链接）")
+        added, skipped = 0, 0
+        with store.lock:
+            existing = {item["link"] for item in store.data["nodes"].values()}
+            for raw in text.replace("\r", "\n").split("\n"):
+                line = raw.strip()
+                if not line:
+                    continue
+                if not vless.is_vless(line) or line in existing:
+                    skipped += 1
+                    continue
+                try:
+                    vless.parse_vless_link(line)
+                except ValueError:
+                    skipped += 1
+                    continue
+                nid = secrets.token_hex(8)
+                store.data["nodes"][nid] = {"link": line, "remark": "", "enabled": True, "created": int(time.time())}
+                existing.add(line)
+                added += 1
+            store.save()
+        return {"ok": True, "added": added, "skipped": skipped}
+
+    @app.patch("/admin/api/nodes/{nid}")
+    async def edit_node(nid: str, req: Request):
+        store.require_admin(req)
+        body = await payload(req)
+        with store.lock:
+            item = store.data["nodes"].get(nid)
+            if not item:
+                raise HTTPException(404, "节点不存在")
+            new = dict(item)
+            if "remark" in body:
+                if not isinstance(body["remark"], str) or len(body["remark"]) > 60:
+                    raise HTTPException(400, "备注需为 60 字以内")
+                new["remark"] = body["remark"].strip()
+            if "enabled" in body:
+                if type(body["enabled"]) is not bool:
+                    raise HTTPException(400, "启用状态不正确")
+                new["enabled"] = body["enabled"]
+            store.data["nodes"][nid] = new
+            store.save()
+        return {"ok": True}
+
+    @app.delete("/admin/api/nodes/{nid}")
+    async def delete_node(nid: str, req: Request):
+        store.require_admin(req)
+        with store.lock:
+            if nid not in store.data["nodes"]:
+                raise HTTPException(404, "节点不存在")
+            del store.data["nodes"][nid]
+            store.save()
+        return {"ok": True}
+
+    @app.post("/admin/api/nodes/probe")
+    async def probe_nodes(req: Request):
+        store.require_admin(req)
+        body = await payload(req)
+        nid = body.get("id")
+        with store.lock:
+            items = list(store.data["nodes"].items())
+        if nid:
+            items = [(key, item) for key, item in items if key == nid]
+        results = []
+        for key, item in items:
+            if not nid and not item.get("enabled"):
+                continue
+            result = await asyncio.to_thread(vless.NODES.probe, item["link"])
+            results.append({"id": key, "ok": result.get("ok"), "ms": result.get("ms"),
+                            "ip": result.get("ip"), "error": result.get("error")})
+        return {"results": results}
+
+    @app.post("/admin/api/nodes/assign")
+    async def assign_nodes(req: Request):
+        store.require_admin(req)
+        body = await payload(req)
+        mode = body.get("mode", "round_robin")
+        with store.lock:
+            aids = [aid for aid, item in store.data["accounts"].items() if item.get("enabled")]
+            enabled_links = [item["link"] for item in store.data["nodes"].values() if item.get("enabled")]
+            # 优先用探测通过的节点；没有探测结果时退回全部启用节点。
+            healthy = [link for link in enabled_links if (vless.NODES.health.get(link) or {}).get("ok")]
+            pool_links = healthy or enabled_links
+            if mode != "clear" and not pool_links:
+                raise HTTPException(400, "节点池没有可用节点，请先添加并启用节点")
+            for index, aid in enumerate(aids):
+                link = "" if mode == "clear" else pool_links[index % len(pool_links)]
+                store.data["accounts"][aid]["proxy"] = link
+                store.manager_for(aid, store.data["accounts"][aid]).set_proxy(link)
+            store.save()
+        return {"ok": True, "mode": mode, "assigned": 0 if mode == "clear" else len(aids),
+                "accounts": len(aids), "nodes": 0 if mode == "clear" else len(pool_links)}
 
     @app.post("/admin/api/accounts")
     async def add_account(req: Request):
@@ -555,7 +730,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             aid = secrets.token_hex(8)
             filename = aid + ".info"
             write_json(store.auth_dir / filename, doc)
-            store.data["accounts"][aid] = {"file": filename, "name": name, "created": int(time.time()), "enabled": True, "max_concurrent": 0}
+            store.data["accounts"][aid] = {"file": filename, "name": name, "created": int(time.time()), "enabled": True, "max_concurrent": 0, "proxy": "", "never_cooldown": False}
             if store.data["active"] is None:
                 store.data["active"] = aid
             store.save()
@@ -582,6 +757,12 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 if type(value) is not int or isinstance(value, bool) or not 0 <= value <= 1000:
                     raise HTTPException(400, "并发上限需为 0–1000 的整数（0 表示不限）")
                 new["max_concurrent"] = value
+            if "proxy" in body:
+                new["proxy"] = validate_proxy(body["proxy"])
+            if "never_cooldown" in body:
+                if type(body["never_cooldown"]) is not bool:
+                    raise HTTPException(400, "永不冷却开关无效")
+                new["never_cooldown"] = body["never_cooldown"]
             if body.get("active") is True:
                 if not new["enabled"]:
                     raise HTTPException(400, "请先启用账号")
@@ -591,6 +772,9 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                     raise HTTPException(400, "凭据文件无法读取，请重新导入")
                 store.data["active"] = aid
             store.data["accounts"][aid] = new
+            current = store.managers.get(aid)
+            if current is not None:
+                current.set_proxy(new.get("proxy"))
             if not new["enabled"] and store.data["active"] == aid:
                 store.data["active"] = None
             store.save()

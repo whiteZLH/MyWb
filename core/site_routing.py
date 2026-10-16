@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import uuid
 
 DOMESTIC = "domestic"
 INTERNATIONAL = "international"
@@ -92,6 +93,23 @@ def identity_headers(profile: str) -> dict:
         "X-IDE-Type": "WorkBuddy",
         "X-IDE-Name": "WorkBuddy",
         "X-IDE-Version": WORKBUDDY_VERSION,
+    }
+
+
+def conversation_headers() -> dict:
+    """官方客户端的会话头族；上游渠道校验缺它时回 400 / code 11-128。
+
+    自 2026-10-16 起，国际站（www.workbuddy.ai）的 /v2/chat/completions 渠道
+    校验要求请求带 X-Conversation-ID / -Request-ID / -Message-ID，缺任一项即
+    返回 HTTP 400、code 11-128、msg「conversation id missing」。上游不按这个
+    id 保存历史，它只是渠道/会话标记（实测同一 id 连发两轮仍无上下文），所以
+    每次请求现造一组互不相同的 v4 UUID 即可，无需维护会话映射。国内站带与不带
+    都通过，故两站统一发送，避免两条路径分叉。
+    """
+    return {
+        "X-Conversation-ID": str(uuid.uuid4()),
+        "X-Conversation-Request-ID": str(uuid.uuid4()),
+        "X-Conversation-Message-ID": str(uuid.uuid4()),
     }
 
 

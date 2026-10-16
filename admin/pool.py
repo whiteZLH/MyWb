@@ -3,6 +3,8 @@ import asyncio
 import hashlib
 import json
 import math
+import random
+import re
 import threading
 import time
 from contextvars import ContextVar
@@ -14,9 +16,96 @@ from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
 from core.site_routing import billing_host_for_headers
+from core import rate_limit
+from core import vless
 
 REQUEST_CREDENTIAL = ContextVar("pool_credential", default=None)
 CN = timezone(timedelta(hours=8))
+
+# ---------------------------------------------------------------------------
+# 上游错误分层与冷却策略
+#
+# 目标：把"账号级 / 模型级 / 出口 IP 级"三类问题分开处置，避免一律当成
+# "账号 429 冷却 30 分钟"。三条经验来自同类项目实测：
+#   1) WAF/限流拦的是**出口 IP**，不是单个账号——账号级冷却在这种场景无效，
+#      继续轮转只会加重风控，应当做 IP 级 fail-fast；
+#   2) 429 的恢复时间优先读上游给的重置时间，拿不到才用**有界**指数退避；
+#   3) 退避要加抖动：按密度判罚的风控会被"齐步走"的固定周期再次聚团。
+# ---------------------------------------------------------------------------
+
+# 出口 IP 级 fail-fast：60s 滑窗内"不同账号"命中 WAF 达阈值即判定 IP 被拦。
+EGRESS_WINDOW = 60.0
+EGRESS_DISTINCT = 2
+EGRESS_BLOCK = 300.0
+
+# 各类错误的冷却参数（秒）。
+IP_COOLDOWN = 60.0        # WAF/无信封限流：账号侧只做短冷却，主要靠 IP 闸
+AUTH_COOLDOWN = 300.0     # 认证被拒
+NOT_FOUND_COOLDOWN = 60.0
+SOFT_BASE = 60.0          # 账号级软限流退避基数
+SOFT_MAX = 1800.0         # 退避封顶
+SERVER_COOLDOWN = 120.0   # 连续 5xx 熔断基数
+SERVER_MAX = 1800.0
+SERVER_THRESHOLD = 3
+
+
+def classify(status, code=None):
+    """按上游返回给账号/出口定性。
+
+    ``status`` 是 HTTP 状态码（或 SSE 错误信封里的数字 code）；
+    ``code`` 是业务信封里的 ``code``（没有则为 None）。
+    "无业务信封" = 上游根本没回业务结构（例如 WAF 页面）。
+    """
+    if status is None:
+        return "client"
+    if status < 400:
+        return "ok"
+    if status == 402:
+        return "credit"
+    if status == 401:
+        return "auth"
+    if status == 403:
+        return "auth" if code is not None else "ip"
+    if status == 404:
+        return "not_found"
+    if status == 429:
+        # 带业务信封（如 code 6004/14018）是账号/模型级；无信封是出口 IP 级。
+        return "rate" if code is not None else "ip"
+    if status >= 500 or status in (408, 425):
+        return "server"
+    return "client"
+
+
+def _next_daily_reset(now: float) -> float:
+    """下一个本地 04:00 的墙钟时间戳（日额度重置后的安全时点）。"""
+    current = datetime.fromtimestamp(now, CN)
+    reset = current.replace(hour=4, minute=0, second=0, microsecond=0)
+    if reset <= current:
+        reset += timedelta(days=1)
+    return reset.timestamp()
+
+
+def _envelope_code(text: str):
+    """从非 SSE 响应体里尽力提取业务信封 ``code``；无则 None（视为无信封）。"""
+    if not text:
+        return None
+    stripped = text.lstrip()
+    if stripped[:1] in ("{", "["):
+        try:
+            obj = json.loads(text)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict):
+            code = obj.get("code")
+            if isinstance(code, bool):
+                return None
+            if isinstance(code, int):
+                return code
+            if isinstance(code, str) and code.lstrip("-").isdigit():
+                return int(code)
+    match = re.search(r'"code"\s*:\s*"?(-?\d+)', text)
+    return int(match.group(1)) if match else None
+
 
 
 def number(value):
@@ -55,14 +144,18 @@ class BillingError(Exception):
 class AccountPool:
     def __init__(self, store, clock=time.time, client_factory=None):
         self.store, self.clock = store, clock
-        self.client_factory = client_factory or (lambda: httpx.Client(timeout=20, follow_redirects=False))
+        self.client_factory = client_factory or (lambda **kw: httpx.Client(timeout=20, follow_redirects=False, **kw))
         self.locks = {}
         self.cursor = 0
         self.inflight = {}
         self.jobs = asyncio.Lock()
         self.last_sync = 0
+        # 出口 IP 级 fail-fast 状态（进程维度，不持久化）。
+        self._waf_sources = {}          # 窗口内命中 WAF 的账号 -> 最近时间戳
+        self._egress_blocked_until = 0.0
         with store.lock:
-            store.data.setdefault("pool", {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00"})
+            store.data.setdefault("pool", {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00",
+                                           "egress_rps": 2.0, "egress_burst": 1, "egress_max_wait": 10.0})
             store.data.setdefault("account_status", {})
             store.data.setdefault("session_bindings", {})
             store.save()
@@ -117,7 +210,7 @@ class AccountPool:
             return "paused"
         if row["status"] == "invalid" or status.get("auth_invalid"):
             return "invalid"
-        if status.get("cooldown_until", 0) > self.clock():
+        if not row.get("never_cooldown") and status.get("cooldown_until", 0) > self.clock():
             return "cooling"
         if status.get("credits_updated", 0) > self.clock() - 600 and status.get("remaining") == 0 and status.get("packages", 0) > 0:
             return "exhausted"
@@ -139,6 +232,10 @@ class AccountPool:
 
     def select(self, affinity_key=None):
         with self.store.lock:
+            blocked = self._egress_blocked_until - self.clock()
+            if blocked > 0:
+                # IP 级 fail-fast：继续轮转只会加重风控，直接快速失败。
+                raise HTTPException(503, f"出口 IP 命中上游风控，已暂停调度 {int(blocked) + 1} 秒")
             candidates = [row for row in self.store.account_rows()
                           if self.state(row) == "available"]
             if self.store.data["pool"]["routing"] == "manual":
@@ -166,21 +263,87 @@ class AccountPool:
             item = self.store.data["accounts"][aid]
             return aid, self.store.manager_for(aid, item)
 
-    def record(self, aid, status=200):
+    def record(self, aid, status=200, code=None):
+        """按错误类别处置账号与出口。``code`` 为业务信封 code（无则 None）。"""
+        now = self.clock()
+        kind = classify(status, code)
         with self.store.lock:
-            if aid not in self.store.data["accounts"]:
+            item = self.store.data["accounts"].get(aid)
+            if not item:
                 return
             data = self.store.data["account_status"].setdefault(aid, {})
             data["request_count"] = data.get("request_count", 0) + 1
-            data["last_request"] = int(self.clock())
-            if status in (401, 403):
-                data.update(cooldown_until=self.clock() + 300, last_error="上游认证或访问被拒绝，已冷却 5 分钟")
-            elif status in (402, 429):
-                data.update(cooldown_until=self.clock() + 1800, last_error="上游额度或频率限制，已冷却 30 分钟")
+            data["last_request"] = int(now)
+            if kind == "ok":
+                # 成功是唯一权威的“恢复证据”：清零退避与连败计数。
+                data["soft_streak"] = 0
+                data["fails"] = 0
+                self.store.save()
+                return
+            if kind == "ip":
+                self._note_ip_event(aid, now)
+            cooldown, message = self._cooldown_for(kind, data, now)
+            if message is not None:
+                data["last_error"] = message
+            if kind == "auth":
+                data["auth_invalid"] = True
+            # “永不冷却”账号：只记错误与计数，不写 cooldown_until。
+            if cooldown is not None and not item.get("never_cooldown"):
+                data["cooldown_until"] = max(data.get("cooldown_until", 0), cooldown) if kind == "server" else cooldown
             self.store.save()
+
+    def _cooldown_for(self, kind, data, now):
+        """返回 (冷却截止时间戳或 None, 提示语或 None)；只做状态计算，不落库。"""
+        if kind == "ip":
+            return now + IP_COOLDOWN, "出口 IP 触发上游 WAF/限流，账号短冷却"
+        if kind == "rate":
+            streak = int(data.get("soft_streak", 0)) + 1
+            data["soft_streak"] = streak
+            delay = min(SOFT_BASE * (2 ** (streak - 1)), SOFT_MAX) * random.uniform(0.75, 1.25)
+            return now + delay, f"上游频率限制，已退避 {int(delay)} 秒"
+        if kind == "credit":
+            return _next_daily_reset(now), "积分余额不足，冷却至次日 04:00"
+        if kind == "auth":
+            return now + AUTH_COOLDOWN, "上游认证或访问被拒绝，已冷却"
+        if kind == "server":
+            fails = int(data.get("fails", 0)) + 1
+            data["fails"] = fails
+            if fails >= SERVER_THRESHOLD:
+                delay = min(SERVER_COOLDOWN * (2 ** (fails - SERVER_THRESHOLD)), SERVER_MAX)
+                return now + delay, "上游连续服务端错误，已熔断"
+            return None, f"上游服务端错误（{fails}/{SERVER_THRESHOLD}）"
+        if kind == "not_found":
+            return now + NOT_FOUND_COOLDOWN, "上游返回 404，已短冷却"
+        return None, None  # client：不处罚账号
+
+    def uncool(self, aid):
+        """手动解除账号冷却（同时清零退避与连败计数）。"""
+        with self.store.lock:
+            if aid not in self.store.data["accounts"]:
+                raise HTTPException(404, "账号不存在")
+            data = self.store.data["account_status"].setdefault(aid, {})
+            data["cooldown_until"] = 0
+            data["soft_streak"] = 0
+            data["fails"] = 0
+            data["last_error"] = None
+            self.store.save()
+        return {"id": aid, "ok": True, "message": "已解除冷却"}
+
+    def _note_ip_event(self, aid, now):
+        """记录一次出口 IP 级命中；60s 窗口内不同账号达阈值即打开 IP 闸。"""
+        self._waf_sources = {k: t for k, t in self._waf_sources.items() if t > now - EGRESS_WINDOW}
+        self._waf_sources[aid] = now
+        if len(self._waf_sources) >= EGRESS_DISTINCT and now >= self._egress_blocked_until:
+            self._egress_blocked_until = now + EGRESS_BLOCK
+
+    def egress_blocked_seconds(self):
+        """出口 IP 闸剩余秒数（0 = 未拦）。"""
+        return max(0, int(math.ceil(self._egress_blocked_until - self.clock())))
 
     def billing(self, client, headers, path, body=None):
         host = billing_host_for_headers(headers)
+        # 签到 / 余额 / 积分等短 RPC 也走同一个出口，纳入匀速器避免叠加突发。
+        rate_limit.PACER.acquire()
         response = client.post(host + "/v2/billing/meter/" + path, headers=headers, json=body or {})
         if response.status_code != 200:
             raise BillingError("积分服务请求失败", response.status_code)
@@ -240,9 +403,9 @@ class AccountPool:
                         manager._refresh()
                     self.update(aid, token_refreshed=int(self.clock()), auth_invalid=False, cooldown_until=0, last_error=None)
                     return {"id": aid, "ok": True, "message": "登录凭据已刷新"}
-                headers = manager.get_headers()
+                headers = manager.get_headers(purpose="billing")
                 today = datetime.fromtimestamp(self.clock(), CN).strftime("%Y-%m-%d")
-                with self.client_factory() as client:
+                with self.client_factory(proxy=vless.resolve(getattr(manager, "proxy", None))) as client:
                     message = "积分状态已更新"
                     checkin_error = None
                     try:
@@ -403,32 +566,48 @@ class PoolMiddleware:
         # 记录本次实际选中的账号展示名，供外层 MetricsMiddleware 按账号汇总。
         scope["account_label"] = self.pool.account_label(aid)
         status = 200
-        buffer = b""
+        envelope = None
+        sse_buffer = b""
+        probe = bytearray()
+
+        def absorb(chunk):
+            if chunk and len(probe) < 65536:
+                probe.extend(chunk[: 65536 - len(probe)])
+
         async def observe(message):
-            nonlocal status, buffer
+            nonlocal status, envelope, sse_buffer
             if message["type"] == "http.response.start":
                 status = message["status"]
             if message["type"] == "http.response.body":
-                buffer += message.get("body", b"")
-                while b"\n" in buffer:
-                    line, buffer = buffer.split(b"\n", 1)
-                    if line.startswith(b"data:"):
-                        try:
-                            obj = json.loads(line[5:])
-                            err = obj.get("error") or (obj.get("response") or {}).get("error") or {}
-                            code = err.get("code") if isinstance(err, dict) else None
-                            if isinstance(code, str) and code.isdigit():
-                                code = int(code)
-                            if code in (401, 402, 403, 429):
-                                status = code
-                        except (ValueError, AttributeError):
-                            pass
-                if len(buffer) > 65536:
-                    buffer = b""
+                chunk = message.get("body", b"")
+                absorb(chunk)
+                sse_buffer += chunk
+                while b"\n" in sse_buffer:
+                    line, sse_buffer = sse_buffer.split(b"\n", 1)
+                    if not line.startswith(b"data:"):
+                        continue
+                    try:
+                        obj = json.loads(line[5:])
+                    except ValueError:
+                        continue
+                    err = obj.get("error") or (obj.get("response") or {}).get("error") or {}
+                    code = err.get("code") if isinstance(err, dict) else None
+                    if isinstance(code, str) and code.isdigit():
+                        code = int(code)
+                    if isinstance(code, int):
+                        envelope = code
+                        # SSE 错误信封里的数字常见为 HTTP 语义码（如 429）。
+                        if code in (401, 402, 403, 429):
+                            status = code
+                if len(sse_buffer) > 65536:
+                    sse_buffer = b""
             await send(message)
+
         try:
             await self.app(scope, receive, observe)
         finally:
             REQUEST_CREDENTIAL.reset(token)
             self.pool.release(aid)
-            self.pool.record(aid, status)
+            if envelope is None:
+                envelope = _envelope_code(bytes(probe).decode("utf-8", "replace"))
+            self.pool.record(aid, status, envelope)

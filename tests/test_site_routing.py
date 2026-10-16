@@ -1,5 +1,6 @@
 import base64
 import json
+import re
 import unittest
 from unittest.mock import Mock
 
@@ -22,6 +23,7 @@ from core.site_routing import (
     billing_host_for_headers,
     chat_url_for_auth,
     chat_url_for_headers,
+    conversation_headers,
     domain_for_auth,
     identity_headers,
     profile_for_auth,
@@ -110,6 +112,48 @@ class ProfileRoutingTests(unittest.TestCase):
         self.assertNotIn("gpt-5.6-luna", converter.default_models_for_profile("cn-cli"))
         self.assertIn("gpt-5.6-luna", converter.default_models_for_profile("intl-work"))
         self.assertNotIn("glm-5v-turbo", converter.default_models_for_profile("intl-work"))
+
+
+CONV_TRIO = ("X-Conversation-ID", "X-Conversation-Request-ID", "X-Conversation-Message-ID")
+UUID_V4 = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+
+
+class ConversationHeaderTests(unittest.TestCase):
+    """上游渠道校验要求 chat 请求带会话头族，缺任一项回 400 / code 11-128。"""
+
+    @staticmethod
+    def headers(auth, purpose="chat"):
+        return converter.CredentialManager.__new__(converter.CredentialManager)._build_headers_from(
+            auth, {}, purpose=purpose
+        )
+
+    def test_conversation_headers_are_three_distinct_v4_uuids(self):
+        headers = conversation_headers()
+        values = [headers[name] for name in CONV_TRIO]
+        for value in values:
+            self.assertRegex(value, UUID_V4)
+        # 三个值必须互不相同：复用同一 id 会被上游判定为非法。
+        self.assertEqual(len(set(values)), 3)
+
+    def test_each_call_mints_a_fresh_trio(self):
+        first = conversation_headers()
+        second = conversation_headers()
+        for name in CONV_TRIO:
+            self.assertNotEqual(first[name], second[name])
+
+    def test_chat_headers_carry_the_conversation_trio(self):
+        for auth in (CN_CLI, CN_WORK, INTL_CLI, INTL_WORK):
+            headers = self.headers(auth)
+            for name in CONV_TRIO:
+                self.assertRegex(headers[name], UUID_V4)
+            values = [headers[name] for name in CONV_TRIO]
+            self.assertEqual(len(set(values)), 3)
+
+    def test_refresh_catalog_and_billing_omit_the_conversation_trio(self):
+        for purpose in ("refresh", "catalog", "billing"):
+            headers = self.headers(INTL_WORK, purpose=purpose)
+            for name in CONV_TRIO:
+                self.assertNotIn(name, headers)
 
 
 class LeadingSystemTests(unittest.TestCase):

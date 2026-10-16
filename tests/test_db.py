@@ -24,10 +24,12 @@ class DatabaseTests(unittest.TestCase):
             db = Database(Path(temp) / "mywb.db")
             try:
                 data = {
-                    "accounts": {"a1": {"name": "账号一", "file": "a1.info", "enabled": True, "created": 5}},
+                    "accounts": {"a1": {"name": "账号一", "file": "a1.info", "enabled": True, "created": 5,
+                                        "proxy": "http://127.0.0.1:7897", "never_cooldown": True}},
                     "active": "a1",
                     "keys": {"k1": {"name": "客户端", "hash": "abc", "hint": "sk-…", "created": 6}},
-                    "pool": {"routing": "manual", "auto_checkin": False, "checkin_time": "07:30"},
+                    "pool": {"routing": "manual", "auto_checkin": False, "checkin_time": "07:30",
+                             "egress_rps": 1.5, "egress_burst": 2, "egress_max_wait": 8.0},
                     "account_status": {"a1": {"remaining": 12.5, "checkin_date": "2026-01-01"}},
                     "session_bindings": {"bind": {"account_id": "a1", "expires": 123.5}},
                 }
@@ -36,8 +38,11 @@ class DatabaseTests(unittest.TestCase):
                 self.assertEqual(loaded["active"], "a1")
                 self.assertEqual(loaded["accounts"]["a1"]["name"], "账号一")
                 self.assertTrue(loaded["accounts"]["a1"]["enabled"])
+                self.assertEqual(loaded["accounts"]["a1"]["proxy"], "http://127.0.0.1:7897")
+                self.assertTrue(loaded["accounts"]["a1"]["never_cooldown"])
                 self.assertEqual(loaded["keys"]["k1"]["hash"], "abc")
-                self.assertEqual(loaded["pool"], {"routing": "manual", "auto_checkin": False, "checkin_time": "07:30"})
+                self.assertEqual(loaded["pool"], {"routing": "manual", "auto_checkin": False, "checkin_time": "07:30",
+                                                  "egress_rps": 1.5, "egress_burst": 2, "egress_max_wait": 8.0})
                 self.assertEqual(loaded["account_status"]["a1"]["remaining"], 12.5)
                 self.assertEqual(loaded["session_bindings"]["bind"]["expires"], 123.5)
             finally:

@@ -16,7 +16,7 @@ const query = ref("");
 const filter = ref("all");
 const batchResult = ref("");
 const busyBatch = ref(false);
-const form = reactive({ routing: "manual", auto_checkin: false, checkin_time: "09:00" });
+const form = reactive({ routing: "manual", auto_checkin: false, checkin_time: "09:00", egress_rps: 2, egress_max_wait: 10 });
 
 const filtered = computed(() => {
   const q = query.value.toLowerCase();
@@ -45,6 +45,9 @@ const activeState = computed(() =>
   pool.value.routing === "round_robin" ? "新请求轮流分配，跳过暂停与冷却账号" : "新请求使用手动指定账号"
 );
 
+// 出口 IP 闸：命中上游 WAF 后被判定为 IP 级拦截，期间所有请求快速失败。
+const egressBlocked = computed(() => state.overview?.egress_blocked_seconds ?? 0);
+
 const formEl = ref(null);
 
 // 用户在表单内有焦点时不要被轮询刷新覆盖（沿用旧实现的行为）。
@@ -55,12 +58,20 @@ watch(
     form.routing = value.routing || "manual";
     form.auto_checkin = value.auto_checkin || false;
     form.checkin_time = value.checkin_time || "09:00";
+    form.egress_rps = value.egress_rps ?? 2;
+    form.egress_max_wait = value.egress_max_wait ?? 10;
   },
   { immediate: true, deep: true }
 );
 
 function statusOf(account) {
   return POOL_STATES[account.pool_state] || ["待查询", ""];
+}
+
+function proxyLabel(account) {
+  const value = account.proxy || "";
+  if (!value) return "";
+  return value.toLowerCase().startsWith("vless://") ? "VLESS 节点" : value;
 }
 
 function creditsOf(account) {
@@ -97,11 +108,42 @@ async function act(account, action) {
   }
 }
 
+async function uncool(account) {
+  try {
+    const result = await api(`accounts/${account.id}/actions/uncool`, { method: "POST" });
+    showToast(result.message);
+    await refresh();
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+function askProxy(account) {
+  openConfirm({
+    title: "设置出口代理 / 节点",
+    desc: `「${account.name}」的上游出站。留空 = 走全局（CODEBUDDY_EGRESS_PROXY，或全局 VLESS 节点）。支持 http(s)://host:port、socks5(h)://host:port，或直接粘贴 vless:// 分享链接（程序会自动起本地节点，不同账号填不同链接即不同出站 IP）。`,
+    text: account.proxy || "",
+    textLabel: "代理地址 / VLESS 链接",
+    textPlaceholder: "vless://… 或 http://host:port",
+    submit: (value) => api("accounts/" + account.id, { method: "PATCH", body: { proxy: value } }),
+  });
+}
+
+function askNeverCooldown(account) {
+  openConfirm({
+    title: account.never_cooldown ? "恢复自动冷却？" : "设为永不冷却？",
+    desc: account.never_cooldown
+      ? `「${account.name}」将恢复按错误自动冷却。`
+      : `「${account.name}」遇到 429/403 等错误也不再冷却，会持续参与选号（出口 IP 闸仍可能生效）。`,
+    submit: () => api("accounts/" + account.id, { method: "PATCH", body: { never_cooldown: !account.never_cooldown } }),
+  });
+}
+
 async function saveSettings() {
   try {
     await api("pool/settings", {
       method: "PATCH",
-      body: { routing: form.routing, auto_checkin: form.auto_checkin, checkin_time: form.checkin_time },
+      body: { routing: form.routing, auto_checkin: form.auto_checkin, checkin_time: form.checkin_time, egress_rps: Number(form.egress_rps), egress_max_wait: Number(form.egress_max_wait) },
     });
     await refresh();
     showToast("账号池设置已保存");
@@ -179,6 +221,10 @@ function askDelete(account) {
       </article>
     </div>
 
+    <div v-if="egressBlocked > 0" class="banner warning" role="alert">
+      出口 IP 命中上游 WAF/风控，已暂停调度约 {{ egressBlocked }} 秒。期间新请求会快速失败（避免继续加重风控）；请等待恢复，或考虑为账号配置不同出口。
+    </div>
+
     <div class="pool-summary">
       <span>{{ counts }}</span>
       <strong>
@@ -232,12 +278,14 @@ function askDelete(account) {
                     <span v-if="a.active" class="mini-active">手动 / 测试账号</span>
                   </strong>
                   <small>{{ a.uid || a.nickname }}</small>
+                  <small v-if="a.proxy" class="cell-note">代理 {{ proxyLabel(a) }}</small>
                 </div>
               </div>
             </td>
             <td>
               <span class="pill" :class="statusOf(a)[1]">{{ statusOf(a)[0] }}</span>
               <small class="cell-note">{{ a.today_checked_in ? "今日已签到" : "今日未确认签到" }}</small>
+              <small v-if="a.never_cooldown" class="cell-note">永不冷却</small>
               <small v-if="a.cooldown_until > Date.now() / 1000" class="cell-note">
                 至 {{ stamp(a.cooldown_until * 1000) }}
               </small>
@@ -266,9 +314,12 @@ function askDelete(account) {
                   <button @click="act(a, 'checkin')">签到</button>
                   <button @click="act(a, 'refresh')">刷新凭据</button>
                 </template>
+                <button v-if="a.cooldown_until > Date.now() / 1000" @click="uncool(a)">解除冷却</button>
                 <button class="switch" v-if="a.enabled && !a.active" @click="askActivate(a)">设为手动 / 测试</button>
                 <button @click="askRename(a)">备注</button>
                 <button @click="askConcurrency(a)">并发</button>
+                <button @click="askProxy(a)">代理</button>
+                <button @click="askNeverCooldown(a)">{{ a.never_cooldown ? "恢复冷却" : "永不冷却" }}</button>
                 <button @click="askToggle(a)">{{ a.enabled ? "暂停" : "恢复" }}</button>
                 <button class="danger" @click="askDelete(a)">删除</button>
               </div>
@@ -291,8 +342,8 @@ function askDelete(account) {
 
     <form ref="formEl" class="pool-settings" @submit.prevent="saveSettings">
       <div>
-        <h3>自动签到与轮转</h3>
-        <p>北京时间每日签到；错过执行时间会补查，已签到不重复领取。页面每 30 秒刷新，服务器每 5 分钟查询积分。</p>
+        <h3>自动签到 · 轮转 · 出口限速</h3>
+        <p>北京时间每日签到；错过执行时间会补查，已签到不重复领取。页面每 30 秒刷新，服务器每 5 分钟查询积分。出口速率上限是同一出口 IP 上全部上游请求的聚合上限，用于避免触发上游 WAF/429；0 表示关闭。</p>
       </div>
       <div class="pool-controls">
         <label>
@@ -304,6 +355,14 @@ function askDelete(account) {
         </label>
         <label>签到时间（北京时间）<input v-model="form.checkin_time" type="time" required /></label>
         <label class="inline-checkbox"><input v-model="form.auto_checkin" type="checkbox" />每日自动签到</label>
+        <label>
+          出口速率上限（req/s）
+          <input v-model.number="form.egress_rps" type="number" min="0" max="50" step="0.5" />
+        </label>
+        <label>
+          排队等待上限（秒）
+          <input v-model.number="form.egress_max_wait" type="number" min="0" max="120" step="1" />
+        </label>
         <button class="primary" type="submit">保存设置</button>
       </div>
     </form>

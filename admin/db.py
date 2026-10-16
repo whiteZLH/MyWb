@@ -35,6 +35,20 @@ SCHEMA_VERSION = 1
 
 STATUS_DEFAULT = 0
 
+
+def _as_float(value, default):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_int(value, default):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
 # 按天统计的桶字段，顺序即建表列顺序，便于 load/save 对称映射。
 BUCKET_FIELDS = (
     "requests", "success", "http_success", "api_requests", "test_requests",
@@ -54,7 +68,9 @@ CREATE TABLE IF NOT EXISTS accounts (
     file           TEXT NOT NULL,
     enabled        INTEGER NOT NULL DEFAULT 1,
     created        INTEGER NOT NULL DEFAULT 0,
-    max_concurrent INTEGER NOT NULL DEFAULT 0
+    max_concurrent INTEGER NOT NULL DEFAULT 0,
+    proxy          TEXT NOT NULL DEFAULT '',
+    never_cooldown INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -70,11 +86,22 @@ CREATE TABLE IF NOT EXISTS app_state (
     value TEXT
 );
 
+CREATE TABLE IF NOT EXISTS nodes (
+    id      TEXT PRIMARY KEY,
+    link    TEXT NOT NULL,
+    remark  TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS pool_settings (
-    id           INTEGER PRIMARY KEY CHECK (id = 1),
-    routing      TEXT NOT NULL,
-    auto_checkin INTEGER NOT NULL,
-    checkin_time TEXT NOT NULL
+    id             INTEGER PRIMARY KEY CHECK (id = 1),
+    routing        TEXT NOT NULL,
+    auto_checkin   INTEGER NOT NULL,
+    checkin_time   TEXT NOT NULL,
+    egress_rps     REAL NOT NULL DEFAULT 2.0,
+    egress_burst   INTEGER NOT NULL DEFAULT 1,
+    egress_max_wait REAL NOT NULL DEFAULT 10.0
 );
 
 CREATE TABLE IF NOT EXISTS account_status (
@@ -175,8 +202,17 @@ class Database:
     def _ensure_columns(self):
         """为已存在的旧表补齐后续新增的列（``CREATE TABLE IF NOT EXISTS`` 不会加列）。"""
         migrations = {
-            "accounts": {"max_concurrent": "INTEGER NOT NULL DEFAULT 0"},
+            "accounts": {
+                "max_concurrent": "INTEGER NOT NULL DEFAULT 0",
+                "proxy": "TEXT NOT NULL DEFAULT ''",
+                "never_cooldown": "INTEGER NOT NULL DEFAULT 0",
+            },
             "request_log": {"account": "TEXT NOT NULL DEFAULT ''"},
+            "pool_settings": {
+                "egress_rps": "REAL NOT NULL DEFAULT 2.0",
+                "egress_burst": "INTEGER NOT NULL DEFAULT 1",
+                "egress_max_wait": "REAL NOT NULL DEFAULT 10.0",
+            },
         }
         for table, columns in migrations.items():
             existing = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
@@ -222,6 +258,8 @@ class Database:
                 "enabled": bool(row["enabled"]),
                 "created": row["created"],
                 "max_concurrent": int(row["max_concurrent"] or 0),
+                "proxy": str(row["proxy"] or ""),
+                "never_cooldown": bool(row["never_cooldown"]),
             }
             for row in rows
         }
@@ -239,15 +277,32 @@ class Database:
             for row in rows
         }
 
+    def nodes(self):
+        with self.lock:
+            rows = self.conn.execute("SELECT * FROM nodes ORDER BY created, id").fetchall()
+        return {
+            row["id"]: {
+                "link": row["link"],
+                "remark": row["remark"],
+                "enabled": bool(row["enabled"]),
+                "created": row["created"],
+            }
+            for row in rows
+        }
+
     def pool_settings(self):
         with self.lock:
             row = self.conn.execute("SELECT * FROM pool_settings WHERE id = 1").fetchone()
         if row is None:
-            return {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00"}
+            return {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00",
+                    "egress_rps": 2.0, "egress_burst": 1, "egress_max_wait": 10.0}
         return {
             "routing": row["routing"],
             "auto_checkin": bool(row["auto_checkin"]),
             "checkin_time": row["checkin_time"],
+            "egress_rps": float(row["egress_rps"]),
+            "egress_burst": int(row["egress_burst"]),
+            "egress_max_wait": float(row["egress_max_wait"]),
         }
 
     def account_status(self):
@@ -281,6 +336,7 @@ class Database:
             "accounts": self.accounts(),
             "active": self.active_account(),
             "keys": self.api_keys(),
+            "nodes": self.nodes(),
             "pool": self.pool_settings(),
             "account_status": self.account_status(),
             "session_bindings": self.session_bindings(),
@@ -292,18 +348,20 @@ class Database:
         keys = data.get("keys") or {}
         status = data.get("account_status") or {}
         bindings = data.get("session_bindings") or {}
-        pool = data.get("pool") or {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00"}
+        pool = data.get("pool") or {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00",
+                                    "egress_rps": 2.0, "egress_burst": 1, "egress_max_wait": 10.0}
         active = data.get("active")
         with self.lock:
             try:
                 self.conn.execute("BEGIN")
                 self.conn.execute("DELETE FROM accounts")
                 self.conn.executemany(
-                    "INSERT INTO accounts (id, name, file, enabled, created, max_concurrent) VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO accounts (id, name, file, enabled, created, max_concurrent, proxy, never_cooldown) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     [
                         (aid, str(item.get("name") or ""), str(item.get("file") or ""),
                          int(bool(item.get("enabled"))), int(item.get("created") or 0),
-                         max(0, int(item.get("max_concurrent") or 0)))
+                         max(0, int(item.get("max_concurrent") or 0)),
+                         str(item.get("proxy") or ""), int(bool(item.get("never_cooldown"))))
                         for aid, item in accounts.items()
                     ],
                 )
@@ -314,6 +372,16 @@ class Database:
                         (kid, str(item.get("name") or ""), str(item.get("hash") or ""),
                          str(item.get("hint") or ""), int(item.get("created") or 0))
                         for kid, item in keys.items()
+                    ],
+                )
+                nodes = data.get("nodes") or {}
+                self.conn.execute("DELETE FROM nodes")
+                self.conn.executemany(
+                    "INSERT INTO nodes (id, link, remark, enabled, created) VALUES (?, ?, ?, ?, ?)",
+                    [
+                        (nid, str(item.get("link") or ""), str(item.get("remark") or ""),
+                         int(bool(item.get("enabled", True))), int(item.get("created") or 0))
+                        for nid, item in nodes.items()
                     ],
                 )
                 self.conn.execute("DELETE FROM account_status")
@@ -330,9 +398,12 @@ class Database:
                     ],
                 )
                 self.conn.execute(
-                    "INSERT OR REPLACE INTO pool_settings (id, routing, auto_checkin, checkin_time) VALUES (1, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO pool_settings (id, routing, auto_checkin, checkin_time, egress_rps, egress_burst, egress_max_wait) "
+                    "VALUES (1, ?, ?, ?, ?, ?, ?)",
                     (str(pool.get("routing") or "round_robin"), int(bool(pool.get("auto_checkin", True))),
-                     str(pool.get("checkin_time") or "09:00")),
+                     str(pool.get("checkin_time") or "09:00"),
+                     _as_float(pool.get("egress_rps"), 2.0), _as_int(pool.get("egress_burst"), 1),
+                     _as_float(pool.get("egress_max_wait"), 10.0)),
                 )
                 self.conn.execute(
                     "INSERT OR REPLACE INTO app_state (key, value) VALUES ('active', ?)",

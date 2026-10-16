@@ -15,6 +15,7 @@ import DashboardView from "./views/DashboardView.vue";
 import StatsView from "./views/StatsView.vue";
 import RequestsView from "./views/RequestsView.vue";
 import AccountsView from "./views/AccountsView.vue";
+import NodesView from "./views/NodesView.vue";
 import KeysView from "./views/KeysView.vue";
 import TestView from "./views/TestView.vue";
 import GuideView from "./views/GuideView.vue";
@@ -27,6 +28,7 @@ const NAV = [
   { key: "stats", label: "运行统计", icon: "◷" },
   { key: "requests", label: "请求记录", icon: "≡" },
   { key: "accounts", label: "账号池", icon: "◫" },
+  { key: "nodes", label: "节点池", icon: "⇄" },
   { key: "keys", label: "API 密钥", icon: "⌘" },
   { key: "test", label: "连接测试", icon: "↗" },
   { key: "guide", label: "接入指南", icon: "☰" },
@@ -37,6 +39,7 @@ const VIEWS = {
   stats: StatsView,
   requests: RequestsView,
   accounts: AccountsView,
+  nodes: NodesView,
   keys: KeysView,
   test: TestView,
   guide: GuideView,

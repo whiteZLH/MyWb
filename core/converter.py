@@ -46,6 +46,8 @@ except ImportError:  # 模块缺失时降级为不脱敏
 
 
 from . import settings
+from . import rate_limit
+from . import vless
 from .anthropic_adapter import (
     AnthropicStreamConverter,
     anthropic_request_to_chat,
@@ -68,6 +70,7 @@ from .site_routing import (
     PROFILE_ENDPOINTS,
     chat_url_for_auth,
     chat_url_for_headers,
+    conversation_headers,
     domain_for_auth,
     identity_headers,
     profile_for_auth,
@@ -157,6 +160,46 @@ def find_auth_file() -> Path | None:
 
 
 # ---------------------------------------------------------------------------
+# 出口代理（全局环境变量 + 账号级覆盖）
+# ---------------------------------------------------------------------------
+
+
+def _normalize_proxy(value) -> str | None:
+    """规整代理串；空/空白 -> None（直连或交给 httpx 环境变量）。"""
+    text = (value or "").strip()
+    return text or None
+
+
+def egress_proxy() -> str | None:
+    """全局出口代理：``CODEBUDDY_EGRESS_PROXY``（环境变量 / .env）。
+
+    空 = 不显式设置代理（httpx 仍会读取 HTTP(S)_PROXY / ALL_PROXY）。
+    Docker 部署直接 ``-e CODEBUDDY_EGRESS_PROXY=http://host:port`` 即可。
+    """
+    return _normalize_proxy(settings.get("CODEBUDDY_EGRESS_PROXY"))
+
+
+def _resolve_proxy_for(cred) -> str | None:
+    """账号级 > 全局 env > 全局 VLESS 节点 > 直连；``vless://`` 解析为本地代理。"""
+    account = getattr(cred, "proxy", None) if cred is not None else None
+    if account:
+        return vless.resolve(account)
+    static = egress_proxy()
+    if static:
+        return vless.resolve(static)
+    return vless.default_proxy()
+
+
+def _cred_proxy() -> str | None:
+    """本次请求使用的出口代理。解析失败会抛错（不静默直连）。"""
+    try:
+        cred = _cred()
+    except HTTPException:
+        cred = None
+    return _resolve_proxy_for(cred)
+
+
+# ---------------------------------------------------------------------------
 # Auth 凭据管理（读 + 自动刷新 + 回写）
 # ---------------------------------------------------------------------------
 
@@ -164,11 +207,16 @@ def find_auth_file() -> Path | None:
 class CredentialManager:
     """从 auth 文件读取凭据；token 临近过期时自动刷新并回写。"""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, proxy: str | None = None):
         self.path = path
+        self.proxy = _normalize_proxy(proxy)
         self._lock = threading.Lock()
         self._cached: dict | None = None
         self._mtime: float = 0.0
+
+    def set_proxy(self, proxy):
+        """热更新该账号的出口代理（None/空 = 回落全局或直连）。"""
+        self.proxy = _normalize_proxy(proxy)
 
     def _read_raw(self) -> dict:
         with open(self.path, encoding="utf-8") as f:
@@ -200,12 +248,14 @@ class CredentialManager:
         """按凭据身份调用对应站点的刷新接口，写回 auth 文件与缓存。"""
         s = self._session()
         auth = s.get("auth") or {}
-        headers = self._build_headers_from(auth, s.get("account") or {})
+        headers = self._build_headers_from(auth, s.get("account") or {}, purpose="refresh")
         headers["X-Refresh-Token"] = auth.get("refreshToken", "")
         headers["X-Auth-Refresh-Source"] = "plugin"
         url = refresh_url_for_auth(auth)
         try:
-            with httpx.Client(timeout=15) as c:
+            # 令牌刷新是额外的真实上游请求：纳入同一匀速器，避免叠加突发。
+            rate_limit.PACER.acquire()
+            with httpx.Client(timeout=15, proxy=self.proxy) as c:
                 r = c.post(url, headers=headers, json={})
             data = r.json()
         except Exception as e:
@@ -237,7 +287,7 @@ class CredentialManager:
         self._cached = s
         self._mtime = self.path.stat().st_mtime
 
-    def _build_headers_from(self, auth: dict, account: dict) -> dict:
+    def _build_headers_from(self, auth: dict, account: dict, purpose: str = "chat") -> dict:
         try:
             profile = profile_for_auth(auth)
         except ValueError:
@@ -263,6 +313,10 @@ class CredentialManager:
         }
         # 上游 /v3/config 会校验 UA 中的产品版本；CLI 与 WorkBuddy 身份头不同。
         h.update(identity_headers(profile))
+        # 会话头族只随 chat/completions 出站：上游渠道校验缺它时回 11-128。
+        # refresh / catalog / billing 不发送，缩小影响面（参照 workbuddy2api-hub #381）。
+        if purpose == "chat":
+            h.update(conversation_headers())
         return h
 
     def profile(self) -> str:
@@ -273,13 +327,17 @@ class CredentialManager:
         """返回该凭据对应的 chat 端点。"""
         return chat_url_for_auth(self._session().get("auth") or {})
 
-    def get_headers(self) -> dict:
-        """返回带最新 token 的后端请求 header；必要时先刷新。"""
+    def get_headers(self, purpose: str = "chat") -> dict:
+        """返回带最新 token 的后端请求 header；必要时先刷新。
+
+        purpose="chat" 时附带会话头族；refresh / catalog / billing 传其它值，
+        不含会话头。
+        """
         with self._lock:
             if self._is_expired():
                 self._refresh()
             s = self._session()
-            return self._build_headers_from(s.get("auth") or {}, s.get("account") or {})
+            return self._build_headers_from(s.get("auth") or {}, s.get("account") or {}, purpose=purpose)
 
     def summary(self) -> dict:
         s = self._session()
@@ -485,7 +543,7 @@ _catalog_cache: dict[str, tuple[float, list[str]]] = {}
 _catalog_lock = threading.Lock()
 
 
-def _fetch_models_from_upstream(profile: str, headers: dict, *, force: bool = False) -> list[str]:
+def _fetch_models_from_upstream(profile: str, headers: dict, *, force: bool = False, proxy: str | None = None) -> list[str]:
     """用账号凭据向上游拉取真实模型目录；失败返回空列表。
 
     成功结果按 profile 缓存 5 分钟。失败不写缓存，下次调用会重试。
@@ -500,7 +558,9 @@ def _fetch_models_from_upstream(profile: str, headers: dict, *, force: bool = Fa
         if cached and now - cached[0] < _CATALOG_TTL:
             return list(cached[1])
     try:
-        with httpx.Client(timeout=15) as c:
+        # 模型目录拉取也是真实上游请求：纳入同一匀速器。
+        rate_limit.PACER.acquire()
+        with httpx.Client(timeout=15, proxy=proxy) as c:
             r = c.get(host + "/v3/config", headers=headers)
         if r.status_code != 200:
             return []
@@ -543,14 +603,20 @@ def get_available_models(*, force: bool = False) -> list[str]:
     headers = None
     if cred is not None:
         try:
-            headers = cred.get_headers()
+            headers = cred.get_headers(purpose="catalog")
             profile = profile_of_headers(headers)
         except Exception:
             headers = None
     if headers is not None:
-        models = _fetch_models_from_upstream(profile, headers, force=force)
-        if models:
-            return models
+        try:
+            proxy = _resolve_proxy_for(cred)
+        except Exception:
+            # 代理/节点不可用时不要直连（会暴露本机 IP），直接退回内置列表。
+            proxy, headers = None, None
+        if headers is not None:
+            models = _fetch_models_from_upstream(profile, headers, force=force, proxy=proxy)
+            if models:
+                return models
 
     workbuddy_models = _load_models_from_workbuddy()
 
@@ -661,6 +727,24 @@ def _cred() -> CredentialManager:
             },
         )
     return CONFIG["cred"]
+
+
+async def _acquire_egress():
+    """上游出口匀速：排队等待超过上限时返回 429（速率受限）。
+
+    放在各 handler 的"即将发起上游请求"处调用，以便在返回流式响应之前就能
+    给出真正的 HTTP 429（而不是流内错误事件）。1 个客户端请求记 1 次。
+    """
+    if not await rate_limit.PACER.acquire_async(timeout=rate_limit.PACER.max_wait):
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": {
+                    "message": "上游请求速率受限，请稍后重试",
+                    "type": "rate_limit_error",
+                }
+            },
+        )
 
 
 @app.get("/health")
@@ -784,6 +868,9 @@ async def chat_completions(
     url = chat_url_for_headers(headers)
     t0 = time.time()
 
+    # 上游出口匀速：此处取令牌，超过排队上限即返回 429（速率受限）。
+    await _acquire_egress()
+
     if client_wants_stream:
         return StreamingResponse(
             _stream_upstream(url, headers, body, model_name, t0, rid),
@@ -793,7 +880,7 @@ async def chat_completions(
 
     # 非流式：后端只支持流式，这里把后端 SSE 聚合成单个 chat.completion 响应
     try:
-        async with httpx.AsyncClient(timeout=300) as c:
+        async with httpx.AsyncClient(timeout=300, proxy=_cred_proxy()) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     raw = await r.aread()
@@ -1106,7 +1193,7 @@ async def _stream_upstream(
     prefix = f"[{rid}] " if rid else ""
 
     try:
-        async with httpx.AsyncClient(timeout=None) as c:
+        async with httpx.AsyncClient(timeout=None, proxy=_cred_proxy()) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     err = await r.aread()
@@ -1201,7 +1288,7 @@ def _chat_body_desensitize(body: dict, *, force_compact: bool = False) -> dict:
 
 
 async def _post_backend_once(url: str, headers: dict, body: dict) -> tuple[int, bytes]:
-    async with httpx.AsyncClient(timeout=120) as c:
+    async with httpx.AsyncClient(timeout=120, proxy=_cred_proxy()) as c:
         async with c.stream("POST", url, headers=headers, json=body) as r:
             chunks: list[bytes] = []
             async for chunk in r.aiter_bytes():
@@ -1321,6 +1408,8 @@ async def create_response(
     url = chat_url_for_headers(headers)
     t0 = time.time()
 
+    await _acquire_egress()
+
     if client_wants_stream:
         return StreamingResponse(
             _stream_responses(url, headers, chat_body, model_name, t0, rid),
@@ -1382,7 +1471,7 @@ async def _stream_responses(
 
     raw_sse_lines = []
     try:
-        async with httpx.AsyncClient(timeout=300) as client:
+        async with httpx.AsyncClient(timeout=300, proxy=_cred_proxy()) as client:
             async with client.stream("POST", url, headers=headers, json=body) as response:
                 if response.status_code != 200:
                     raw = await response.aread()
@@ -1503,6 +1592,9 @@ async def create_message(
     url = chat_url_for_headers(headers)
     t0 = time.time()
 
+    # 上游出口匀速：此处取令牌，超过排队上限即返回 429（速率受限）。
+    await _acquire_egress()
+
     # 如果用户请求流式响应，直接返回流式
     if user_stream:
         return StreamingResponse(
@@ -1533,7 +1625,7 @@ async def _collect_anthropic_nonstream(
     prefix = f"[{rid}] " if rid else ""
 
     try:
-        async with httpx.AsyncClient(timeout=120.0) as c:
+        async with httpx.AsyncClient(timeout=120.0, proxy=_cred_proxy()) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     err = await r.aread()
@@ -1579,7 +1671,7 @@ async def _stream_anthropic(
     prefix = f"[{rid}] " if rid else ""
 
     try:
-        async with httpx.AsyncClient(timeout=None) as c:
+        async with httpx.AsyncClient(timeout=None, proxy=_cred_proxy()) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     err = await r.aread()
@@ -1688,8 +1780,10 @@ async def count_tokens(
     chat_body = ensure_leading_system(chat_body, profile_of_headers(headers))
     url = chat_url_for_headers(headers)
 
+    await _acquire_egress()
+
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=30.0, proxy=_cred_proxy()) as client:
             async with client.stream(
                 "POST", url, headers=headers, json=chat_body
             ) as resp:

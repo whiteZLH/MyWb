@@ -6,6 +6,7 @@ import { refresh, showToast } from "../store.js";
 const dialog = ref(null);
 const renameValue = ref("");
 const numberValue = ref(0);
+const textValue = ref("");
 const error = ref("");
 const busy = ref(false);
 
@@ -15,6 +16,7 @@ watch(
     if (open) {
       renameValue.value = ui.confirm.rename ?? "";
       numberValue.value = ui.confirm.number ?? 0;
+      textValue.value = ui.confirm.text ?? "";
       error.value = "";
       dialog.value?.showModal();
     } else {
@@ -30,9 +32,11 @@ async function onSubmit() {
     const submit = ui.confirm.submit;
     const rename = ui.confirm.rename;
     const number = ui.confirm.number;
+    const text = ui.confirm.text;
     let value;
     if (rename !== null) value = renameValue.value;
     else if (number !== null) value = Number(numberValue.value);
+    else if (text !== null) value = textValue.value;
     await submit(value);
     closeConfirm();
     await refresh();
@@ -58,6 +62,10 @@ async function onSubmit() {
         <label for="number-value">{{ ui.confirm.numberLabel || "数值" }}</label>
         <input id="number-value" v-model="numberValue" type="number" min="0" max="1000" step="1" />
         <p class="muted">0 表示不限制并发。</p>
+      </template>
+      <template v-else-if="ui.confirm.text !== null">
+        <label for="text-value">{{ ui.confirm.textLabel || "内容" }}</label>
+        <input id="text-value" v-model="textValue" :placeholder="ui.confirm.textPlaceholder" maxlength="4096" />
       </template>
       <p class="field-error" role="alert">{{ error }}</p>
       <div class="dialog-actions">

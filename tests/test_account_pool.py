@@ -11,7 +11,10 @@ from fastapi import HTTPException
 
 from core import converter
 from admin.server import Store
-from admin.pool import AccountPool, PoolMiddleware, REQUEST_CREDENTIAL, summarize_packages, request_affinity
+from admin.pool import (
+    AccountPool, PoolMiddleware, REQUEST_CREDENTIAL, summarize_packages, request_affinity,
+    classify, _envelope_code, EGRESS_BLOCK, SERVER_THRESHOLD,
+)
 from test_admin_server import credential
 
 
@@ -38,7 +41,7 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
             body=json.loads(req.content)
             self.pages.append(body['PageNumber'])
             return httpx.Response(200,json={'code':0,'data':{'Response':{'Data':{'TotalCount':1,'Accounts':[{'CycleCapacityRemainPrecise':'479.59','CycleCapacitySize':500,'CapacityRemain':500}]}}}})
-        self.pool=AccountPool(self.store,clock=lambda:self.now,client_factory=lambda:httpx.Client(transport=httpx.MockTransport(respond)))
+        self.pool=AccountPool(self.store,clock=lambda:self.now,client_factory=lambda **kw:httpx.Client(transport=httpx.MockTransport(respond), **kw))
         for aid,item in self.store.data['accounts'].items():
             self.store.manager_for(aid,item).get_headers=Mock(return_value={'X-Domain':'www.codebuddy.cn'})
 
@@ -279,6 +282,137 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
             result=self.pool.credits(c,{})
         self.assertEqual(result['packages'],101)
         self.assertEqual(result['remaining'],126.25)
+
+    # ---------------------------------------------------------------- 错误分层
+
+    def test_classify_distinguishes_levels(self):
+        self.assertEqual(classify(200), 'ok')
+        self.assertEqual(classify(429), 'ip')            # 无信封 -> 出口 IP 级
+        self.assertEqual(classify(429, 6004), 'rate')    # 带信封 -> 账号/模型级
+        self.assertEqual(classify(403), 'ip')
+        self.assertEqual(classify(403, 12153), 'auth')   # 带信封 -> 认证
+        self.assertEqual(classify(402), 'credit')
+        self.assertEqual(classify(500), 'server')
+        self.assertEqual(classify(404), 'not_found')
+        self.assertEqual(classify(400, 11101), 'client')
+
+    def test_envelope_code_extraction(self):
+        self.assertEqual(_envelope_code('{"code":6004,"msg":"x"}'), 6004)
+        self.assertEqual(_envelope_code('{"code":"12153"}'), 12153)
+        self.assertEqual(_envelope_code('{"code":11-128,"msg":"x"}'), 11)
+        self.assertIsNone(_envelope_code('<html>WAF blocked</html>'))
+        self.assertIsNone(_envelope_code(''))
+
+    def test_ip_level_fail_fast_gate_opens_on_two_distinct_accounts(self):
+        self.pool.record(self.a, 429)          # 无信封 -> ip 级
+        self.assertEqual(self.pool.egress_blocked_seconds(), 0)   # 单号不触发
+        self.pool.record(self.b, 429)
+        self.assertGreater(self.pool.egress_blocked_seconds(), 0)  # 两号 -> 开闸
+        with self.assertRaises(HTTPException):
+            self.pool.select()
+        self.now += int(EGRESS_BLOCK) + 1
+        self.assertIn(self.pool.select()[0], (self.a, self.b))
+
+    def test_single_account_never_trips_gate(self):
+        for _ in range(5):
+            self.pool.record(self.a, 429)
+        self.assertEqual(self.pool.egress_blocked_seconds(), 0)
+
+    def test_soft_rate_backoff_grows_and_success_clears(self):
+        self.pool.record(self.a, 429, code=6004)
+        first = self.store.data['account_status'][self.a]['cooldown_until']
+        self.assertGreater(first, self.now)
+        self.pool.record(self.a, 429, code=6004)
+        second = self.store.data['account_status'][self.a]['cooldown_until']
+        self.assertGreater(second, first)      # 指数退避 + 抖动：第二次更长
+        self.assertEqual(self.store.data['account_status'][self.a]['soft_streak'], 2)
+        self.pool.record(self.a, 200)
+        self.assertEqual(self.store.data['account_status'][self.a]['soft_streak'], 0)
+
+    def test_credit_cooldown_and_server_breaker_and_client_exempt(self):
+        self.pool.record(self.a, 402)
+        self.assertGreater(self.store.data['account_status'][self.a]['cooldown_until'], self.now)
+        self.store.data['account_status'].pop(self.a, None)
+        for _ in range(SERVER_THRESHOLD - 1):
+            self.pool.record(self.b, 500)
+        self.assertEqual(self.store.data['account_status'][self.b].get('cooldown_until', 0), 0)
+        self.pool.record(self.b, 500)
+        self.assertGreater(self.store.data['account_status'][self.b]['cooldown_until'], self.now)
+        self.pool.record(self.a, 400, code=11101)   # 客户端错误不处罚
+        self.assertEqual(self.store.data['account_status'][self.a].get('cooldown_until', 0), 0)
+
+    async def _run_upstream(self, status, headers, body):
+        async def app(scope, receive, send):
+            await send({'type': 'http.response.start', 'status': status, 'headers': headers})
+            await send({'type': 'http.response.body', 'body': body})
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=PoolMiddleware(app, self.pool)), base_url='http://test') as client:
+            return await client.post('/v1/responses', json={'input': 'x'}, headers={'Authorization': 'Bearer api-test'})
+
+    async def test_middleware_waf_403_is_ip_level(self):
+        response = await self._run_upstream(403, [(b'content-type', b'text/html')], b'<html>WAF blocked</html>')
+        self.assertEqual(response.status_code, 403)
+        hit = [v for v in self.store.data['account_status'].values() if 'WAF' in (v.get('last_error') or '')]
+        self.assertEqual(len(hit), 1)
+
+    async def test_middleware_business_403_is_auth(self):
+        response = await self._run_upstream(403, [(b'content-type', b'application/json')], b'{"code":12153,"msg":"session"}')
+        self.assertEqual(response.status_code, 403)
+        hit = [v for v in self.store.data['account_status'].values() if v.get('auth_invalid')]
+        self.assertEqual(len(hit), 1)
+
+    # ---------------------------------------------------- 永不冷却 / 手动解除
+
+    def test_never_cooldown_skips_account_cooldown(self):
+        self.store.data['accounts'][self.a]['never_cooldown'] = True
+        self.pool.record(self.a, 429, code=6004)          # rate 类
+        data = self.store.data['account_status'][self.a]
+        self.assertEqual(data.get('cooldown_until', 0), 0)
+        self.assertIn('退避', data['last_error'])
+        row = next(r for r in self.store.account_rows() if r['id'] == self.a)
+        self.assertNotEqual(self.pool.state(row), 'cooling')
+        # 普通账号照常冷却
+        self.pool.record(self.b, 429, code=6004)
+        self.assertGreater(self.store.data['account_status'][self.b]['cooldown_until'], self.now)
+
+    def test_uncool_clears_cooldown_and_counters(self):
+        self.pool.record(self.a, 429, code=6004)
+        self.assertGreater(self.store.data['account_status'][self.a]['cooldown_until'], self.now)
+        result = self.pool.uncool(self.a)
+        self.assertTrue(result['ok'])
+        data = self.store.data['account_status'][self.a]
+        self.assertEqual(data['cooldown_until'], 0)
+        self.assertEqual(data['soft_streak'], 0)
+        self.assertIsNone(data['last_error'])
+        row = next(r for r in self.store.account_rows() if r['id'] == self.a)
+        self.assertNotEqual(self.pool.state(row), 'cooling')
+
+    def test_manager_carries_account_proxy(self):
+        self.store.data['accounts'][self.a]['proxy'] = 'http://127.0.0.1:7897'
+        self.store.managers.pop(self.a, None)
+        manager = self.store.manager_for(self.a, self.store.data['accounts'][self.a])
+        self.assertEqual(manager.proxy, 'http://127.0.0.1:7897')
+        manager.set_proxy('')
+        self.assertIsNone(manager.proxy)
+
+    def test_operate_passes_account_proxy_to_client_factory(self):
+        captured = {}
+
+        def handler(req):
+            if req.url.path.endswith('checkin-activity-status'):
+                return httpx.Response(200, json={'code': 0, 'data': {'active': True, 'today_checked_in': True}})
+            return httpx.Response(200, json={'code': 0, 'data': {'Response': {'Data': {'TotalCount': 0, 'Accounts': []}}}})
+
+        def factory(**kw):
+            # 记录收到的 proxy，但返回纯 MockTransport 客户端（proxy 的 mounts 会盖掉 transport）。
+            captured.update(kw)
+            return httpx.Client(transport=httpx.MockTransport(handler))
+
+        self.store.data['accounts'][self.a]['proxy'] = 'http://127.0.0.1:7897'
+        self.store.managers.pop(self.a, None)
+        pool = AccountPool(self.store, clock=lambda: self.now, client_factory=factory)
+        result = pool.operate(self.a, 'status')
+        self.assertTrue(result['ok'])
+        self.assertEqual(captured.get('proxy'), 'http://127.0.0.1:7897')
 
 
 if __name__=='__main__':unittest.main()

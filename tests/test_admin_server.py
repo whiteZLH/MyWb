@@ -7,6 +7,7 @@ from pathlib import Path
 import httpx
 
 import admin.server as admin_server
+from core import rate_limit
 
 ADMIN = "admin-test-credential-long-enough"
 API = "client-existing-key"
@@ -125,6 +126,88 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         await self.login()
         account = (await self.client.get("/admin/api/overview")).json()["accounts"][0]
         self.assertEqual(account["max_concurrent"], 3)
+
+    async def test_pool_egress_settings_validation_and_hot_apply(self):
+        await self.login()
+        for bad in [True, -1, 51, "2"]:
+            r = await self.client.patch("/admin/api/pool/settings", json={"egress_rps": bad})
+            self.assertEqual(r.status_code, 400, r.text)
+        for bad in [0, 21, True]:
+            r = await self.client.patch("/admin/api/pool/settings", json={"egress_burst": bad})
+            self.assertEqual(r.status_code, 400, r.text)
+        for bad in [-1, 121, True]:
+            r = await self.client.patch("/admin/api/pool/settings", json={"egress_max_wait": bad})
+            self.assertEqual(r.status_code, 400, r.text)
+        r = await self.client.patch("/admin/api/pool/settings", json={"egress_rps": 1.5, "egress_burst": 2, "egress_max_wait": 8})
+        self.assertEqual(r.status_code, 200, r.text)
+        # 保存即热生效
+        self.assertEqual(rate_limit.PACER.rps, 1.5)
+        self.assertEqual(rate_limit.PACER.burst, 2)
+        self.assertEqual(rate_limit.PACER.max_wait, 8.0)
+        pool = (await self.client.get("/admin/api/overview")).json()["pool"]
+        self.assertEqual(pool["egress_rps"], 1.5)
+        # 重启后持久化并重新应用
+        await self.client.aclose()
+        self.make_app()
+        await self.login()
+        pool = (await self.client.get("/admin/api/overview")).json()["pool"]
+        self.assertEqual(pool["egress_rps"], 1.5)
+        self.assertEqual(pool["egress_burst"], 2)
+        self.assertEqual(rate_limit.PACER.rps, 1.5)
+
+    async def test_account_proxy_and_cooldown_controls(self):
+        await self.login()
+        aid = (await self.client.get("/admin/api/overview")).json()["accounts"][0]["id"]
+        # 代理校验：非法一律 400
+        for bad in ["ftp://host:1", "http://", "http://a b:1", 123, "socks5://", "http://host:70000"]:
+            r = await self.client.patch("/admin/api/accounts/" + aid, json={"proxy": bad})
+            self.assertEqual(r.status_code, 400, r.text)
+        r = await self.client.patch("/admin/api/accounts/" + aid, json={"proxy": "http://127.0.0.1:7897"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual((await self.client.get("/admin/api/overview")).json()["accounts"][0]["proxy"], "http://127.0.0.1:7897")
+        # VLESS 分享链接也是合法取值（仅解析校验，不会起内核）
+        vless_link = "vless://ca997d60-d8db-4eda-8403-1abd8ea8fcc3@h.example:443?type=ws&security=tls&sni=h.example&path=/x"
+        self.assertEqual((await self.client.patch("/admin/api/accounts/" + aid, json={"proxy": vless_link})).status_code, 200)
+        self.assertEqual((await self.client.patch("/admin/api/accounts/" + aid, json={"proxy": "vless://bad"})).status_code, 400)
+
+        # 手动解除冷却
+        self.app.state.pool.record(aid, 429, code=6004)
+        self.assertGreater(self.app.state.store.data["account_status"][aid]["cooldown_until"], time.time())
+        r = await self.client.post(f"/admin/api/accounts/{aid}/actions/uncool")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self.app.state.store.data["account_status"][aid]["cooldown_until"], 0)
+
+        # 永不冷却开关 + 校验
+        r = await self.client.patch("/admin/api/accounts/" + aid, json={"never_cooldown": True})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue((await self.client.get("/admin/api/overview")).json()["accounts"][0]["never_cooldown"])
+        self.assertEqual((await self.client.patch("/admin/api/accounts/" + aid, json={"never_cooldown": "yes"})).status_code, 400)
+
+    async def test_node_pool_add_probe_assign(self):
+        await self.login()
+        link = "vless://11111111-2222-3333-4444-555555555555@h.example:443?type=ws&security=tls&sni=h.example&path=/x"
+        link2 = link.replace("h.example", "h2.example")
+        r = await self.client.post("/admin/api/nodes", json={"text": f"{link}\n{link2}\nnot-a-link\n{link}"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json(), {"ok": True, "added": 2, "skipped": 2})  # 非法 + 重复
+        nodes = (await self.client.get("/admin/api/overview")).json()["nodes"]
+        self.assertEqual(len(nodes), 2)
+        self.assertEqual(nodes[0]["label"], "h.example:443")
+        # 备注 + 禁用第一个节点
+        first = nodes[0]["id"]
+        r = await self.client.patch("/admin/api/nodes/" + first, json={"remark": "JP1", "enabled": False})
+        self.assertEqual(r.status_code, 200, r.text)
+        # 自动分配：只剩 1 个启用节点 → 账号代理指向它
+        r = await self.client.post("/admin/api/nodes/assign", json={"mode": "round_robin"})
+        self.assertEqual(r.status_code, 200, r.text)
+        account = (await self.client.get("/admin/api/overview")).json()["accounts"][0]
+        self.assertTrue(account["proxy"].startswith("vless://"), account["proxy"])
+        # 清除分配
+        await self.client.post("/admin/api/nodes/assign", json={"mode": "clear"})
+        self.assertEqual((await self.client.get("/admin/api/overview")).json()["accounts"][0]["proxy"], "")
+        # 删除
+        self.assertEqual((await self.client.delete("/admin/api/nodes/" + first)).status_code, 200)
+        self.assertEqual(len((await self.client.get("/admin/api/overview")).json()["nodes"]), 1)
 
     async def test_stats_endpoint_requires_admin(self):
         self.assertEqual((await self.client.get("/admin/api/stats")).status_code, 401)
