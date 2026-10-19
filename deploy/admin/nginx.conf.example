@@ -2,7 +2,7 @@
 # Some Responses clients use /responses instead of /v1/responses.
 rewrite ^/responses/?$ /v1/responses last;
 
-client_max_body_size 100m;
+client_max_body_size 0;
 location / {
     proxy_pass http://127.0.0.1:8787;
     proxy_http_version 1.1;

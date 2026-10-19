@@ -524,8 +524,6 @@ class PoolMiddleware:
                 if message["type"] == "http.disconnect":
                     return
                 raw.extend(message.get("body", b""))
-                if len(raw) > 32 * 1024 * 1024:
-                    raise HTTPException(413, "请求体超过 32 MiB")
                 if not message.get("more_body", False):
                     break
             raw = bytes(raw)

@@ -6,7 +6,8 @@ FROM python:3.12-slim
 ARG SINGBOX_VERSION=1.14.3
 ARG SINGBOX_URL_BASE=https://github.com/SagerNet/sing-box/releases/download
 # BuildKit 会自动注入 TARGETARCH（amd64 / arm64 / arm / 386 ...）。
-ARG TARGETARCH=amd64
+# 旧版 Docker（OpenWrt 常见）不带 BuildKit，不会注入，留空以便回退到 uname -m。
+ARG TARGETARCH
 ARG TARGETVARIANT=""
 # 国内可传 --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ARG PIP_INDEX_URL=""
@@ -18,12 +19,25 @@ RUN if [ -n "$PIP_INDEX_URL" ]; then pip install --no-cache-dir -i "$PIP_INDEX_U
     else pip install --no-cache-dir -r requirements.txt; fi
 
 # 按目标架构下载静态 sing-box 到镜像内（Go 静态编译，可直接跑）。
+# 未注入 TARGETARCH 时用 uname -m 判断，避免旧版 Docker 在 ARM 设备上误取 amd64。
 RUN set -eux; \
-    case "${TARGETARCH}${TARGETVARIANT}" in \
+    target="${TARGETARCH:-}"; \
+    variant="${TARGETVARIANT:-}"; \
+    if [ -z "$target" ]; then \
+      case "$(uname -m)" in \
+        x86_64|amd64) target=amd64 ;; \
+        aarch64|arm64) target=arm64 ;; \
+        armv7l|armv7) target=arm; variant=7 ;; \
+        armv6l|armv6) target=arm; variant=6 ;; \
+        i386|i686|x86) target=386 ;; \
+        *) target=amd64 ;; \
+      esac; \
+    fi; \
+    case "${target}${variant}" in \
       amd64) arch=amd64 ;; \
       arm64) arch=arm64 ;; \
-      armv7) arch=armv7 ;; \
-      armv6) arch=armv6 ;; \
+      armv7|arm7) arch=armv7 ;; \
+      armv6|arm6) arch=armv6 ;; \
       arm) arch=armv7 ;; \
       386) arch=386 ;; \
       *) arch=amd64 ;; \
